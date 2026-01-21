@@ -1,0 +1,11 @@
+pandas
+numpy
+scipy
+statsmodels
+scikit-learn
+google-cloud-storage
+python-dotenv
+gspread
+google-auth
+matplotlib
+torch
