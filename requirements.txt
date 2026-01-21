@@ -3,6 +3,7 @@ numpy
 scipy
 statsmodels
 scikit-learn
+pmdarima
 google-cloud-storage
 python-dotenv
 gspread
