@@ -1,5 +1,6 @@
 import pickle
 import sys
+import warnings
 from google.auth import default
 from google.cloud import storage
 
@@ -38,6 +39,9 @@ except Exception as e:
 
 # Try forecast/predict
 tried = False
+# suppress statsmodels unsupported-index warnings
+warnings.filterwarnings("ignore", category=FutureWarning, message="No supported index is available.*")
+warnings.filterwarnings("ignore", category=Warning, message="No supported index is available.*")
 for method in ('forecast', 'predict'):
     if hasattr(obj, method):
         tried = True

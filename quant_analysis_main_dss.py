@@ -181,6 +181,154 @@ def _gcs_save_model(model_fit, commodity, prefix='models/arima/', d_override=Non
         return None
 
 
+def _is_flatline(fvals, hist_vals, abs_std_thresh=1e-6, rel_range_thresh=1e-3):
+    try:
+        f = np.array(fvals, dtype=float)
+        if f.size == 0:
+            return True
+        hist = np.array(hist_vals, dtype=float)
+        f_std = np.nanstd(f)
+        if f_std < abs_std_thresh:
+            return True
+        hist_mean = np.nanmean(hist) if hist.size else 0.0
+        rng = np.nanmax(f) - np.nanmin(f)
+        if abs(hist_mean) > 1e-9:
+            rel = abs(rng / (abs(hist_mean)))
+            if rel < rel_range_thresh:
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def download_model(commodity, preferred_d=1, prefix='models/arima/'):
+    """Download a saved ARIMA model for `commodity` from GCS.
+    Prefer `preferred_d` and fall back to the other differencing order.
+    Returns tuple (d_used, model_obj) or (None, None) if not found/failed.
+    """
+    norm = re.sub(r"\s+", '_', commodity)
+    bucket = storage_client.bucket(bucket_name)
+    # list candidate blobs under prefix and filter by commodity
+    blobs = list(bucket.list_blobs(prefix=prefix))
+    # helper to find blob for a given d
+    def _find_blob_for_d(d):
+        for b in blobs:
+            name = b.name
+            if norm in name and f"_d{d}_" in name and name.endswith('.pkl'):
+                return b
+        # try a looser match (maybe mNone)
+        for b in blobs:
+            name = b.name
+            if norm in name and f"_d{d}" in name and name.endswith('.pkl'):
+                return b
+        return None
+
+    # try preferred first then fallback
+    for d_try in (preferred_d, 0 if preferred_d == 1 else 1):
+        b = _find_blob_for_d(d_try)
+        if b is None:
+            continue
+        try:
+            data = b.download_as_bytes()
+            obj = pickle.loads(data)
+            return (d_try, obj)
+        except Exception as e:
+            print(f"  Failed to download/unpickle {b.name}: {e}")
+            continue
+
+    return (None, None)
+
+
+def generate_and_save_combined_arima_forecast(forecast_steps=52, gcs_prefix='forecast_data/arima_forecast.csv'):
+    """Generate forecasts for all numeric commodities using saved models,
+    combine with historical `prices_df`, extend the date index for the forecast
+    horizon and save the combined wide DataFrame to GCS as CSV.
+    Returns the combined DataFrame and the GCS prefix used.
+    """
+    forecast_series_dict = {}
+    arima_forecast_results = []
+
+    for commodity in commodity_columns:
+        series = prices_df[commodity].dropna()
+        if series.empty:
+            arima_forecast_results.append({'Commodity': commodity, 'Status': 'Skipped', 'Error Message': 'Empty series'})
+            continue
+
+        # Try preferred d=1 then fallback to d=0
+        d_used, model = download_model(commodity, preferred_d=1)
+        if model is None:
+            d_used, model = download_model(commodity, preferred_d=0)
+
+        if model is None:
+            arima_forecast_results.append({'Commodity': commodity, 'Status': 'NoModel'})
+            continue
+
+        try:
+            if hasattr(model, 'forecast'):
+                fvals = model.forecast(forecast_steps)
+            elif hasattr(model, 'predict'):
+                # pmdarima .predict may accept n_periods or steps; try with int
+                fvals = model.predict(forecast_steps)
+            else:
+                arima_forecast_results.append({'Commodity': commodity, 'Status': 'NoForecastMethod'})
+                continue
+        except Exception as e:
+            arima_forecast_results.append({'Commodity': commodity, 'Status': 'ForecastFailed', 'Error Message': str(e)})
+            continue
+
+        # If flatline, force d=0
+        if _is_flatline(fvals, series.values) and d_used != 0:
+            d0, model0 = download_model(commodity, preferred_d=0)
+            if model0 is not None:
+                try:
+                    if hasattr(model0, 'forecast'):
+                        fvals = model0.forecast(forecast_steps)
+                    elif hasattr(model0, 'predict'):
+                        fvals = model0.predict(forecast_steps)
+                    d_used = 0
+                except Exception:
+                    pass
+
+        # Build forecast dates
+        try:
+            freq = pd.infer_freq(series.index)
+        except Exception:
+            freq = None
+        if freq is None:
+            freq = 'W'
+        last_date = series.index[-1]
+        forecast_dates = pd.date_range(start=last_date, periods=forecast_steps + 1, freq=freq)[1:]
+
+        try:
+            forecast_series = pd.Series(np.array(fvals).astype(float), index=forecast_dates)
+            forecast_series_dict[commodity] = forecast_series
+            arima_forecast_results.append({'Commodity': commodity, 'Status': 'Success', 'd_used': d_used})
+        except Exception as e:
+            arima_forecast_results.append({'Commodity': commodity, 'Status': 'SeriesBuildFailed', 'Error Message': str(e)})
+
+    # Convert results to DataFrame
+    arima_forecast_df = pd.DataFrame(arima_forecast_results)
+
+    # Prepare historical dataframe of numeric commodities
+    historical_df = prices_df[commodity_columns].copy()
+
+    # Prepare forecast wide dataframe
+    if forecast_series_dict:
+        forecast_wide_df = pd.DataFrame(forecast_series_dict)
+    else:
+        forecast_wide_df = pd.DataFrame(columns=historical_df.columns)
+
+    combined_df = pd.concat([historical_df, forecast_wide_df], axis=0, join='outer')
+    combined_df.sort_index(inplace=True)
+    combined_df.index.name = 'Date'
+
+    # Save combined DataFrame to GCS
+    print(f"Saving combined ARIMA forecast results to GCS prefix: {gcs_prefix}")
+    save_dataframe_to_gcs(df=combined_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix, validate_rows=False)
+
+    return combined_df, gcs_prefix
+
+
 if __name__ == '__main__':
     # Build per-commodity tasks
     tasks = []
