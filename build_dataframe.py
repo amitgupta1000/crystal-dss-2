@@ -6,7 +6,7 @@ import pandas as pd
 import numpy as np
 from datetime import date
 import time
-from file_utils import upload_excel_file, save_dataframe_to_gcs
+from src.file_utils import upload_excel_file, save_dataframe_to_gcs
 
 def build_dataframe(uploaded_file=None):
     from google.cloud import storage
@@ -15,7 +15,6 @@ def build_dataframe(uploaded_file=None):
     import yfinance as yf
     import pandas as pd
     import time
-    from file_utils import upload_excel_file, save_dataframe_to_gcs
 
     # If no uploaded_file provided, try interactive upload
     if uploaded_file is None:
