@@ -22,6 +22,11 @@ from google.cloud import storage
 from google.auth import default
 from src.file_utils import save_dataframe_to_gcs, upload_excel_file, download_latest_csv_from_gcs
 import logging
+
+# Suppress common SARIMA warnings
+warnings.filterwarnings("ignore", message="Non-invertible starting seasonal moving average")
+warnings.filterwarnings("ignore", message="Non-stationary starting autoregressive")
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
@@ -82,12 +87,22 @@ if 'prices_df' in locals():
 else:
     print("prices_df DataFrame is not loaded. Cannot proceed.")
 
-# Simple ARIMA grid testing framework (limited p,q,d combinations)
+# ARIMA/SARIMA grid testing framework
 p_values = [0, 1, 2]
 q_values = [0, 1, 2]
 ds = [0, 1]
+# Seasonal periods: 75≈quarterly(weekly data), 125≈semi-annual, 250≈annual, 375≈1.5 year
+m_values = [1, 75, 250]  # 1 = non-seasonal ARIMA
+# Simple seasonal parameters (only test when m > 1)
+seasonal_P = [0, 1]
+seasonal_D = [0, 1]
+seasonal_Q = [0, 1]
 
-print("Using simple ARIMA grid: p_values=", p_values, "q_values=", q_values, "ds=", ds)
+print("Using ARIMA/SARIMA grid:")
+print(f"  Non-seasonal: p={p_values}, d={ds}, q={q_values}")
+print(f"  Seasonal: P={seasonal_P}, D={seasonal_D}, Q={seasonal_Q}, m={m_values}")
+print(f"  Estimated models per commodity: {len(p_values) * len(q_values) * len(ds) * (1 + len(seasonal_P) * len(seasonal_D) * len(seasonal_Q) * (len(m_values) - 1))}")
+print(f"  Note: Adding seasonality will increase fitting time approximately 8-10x")
 
 arima_evaluation_results = []
 best_models = {}
@@ -101,45 +116,68 @@ def _commodity_grid_worker(task):
     commodity, values, index_iso = task
     import pandas as _pd
     import pickle as _pickle
+    from statsmodels.tsa.statespace.sarimax import SARIMAX
     results = []
     best_map = {}
     s = _pd.Series(values, index=_pd.to_datetime(index_iso))
+    
     for d in ds:
-        best_aic = float('inf')
-        best_fit = None
-        best_order = None
-        for p in p_values:
-            for q in q_values:
-                order = (p, d, q)
+        for m in m_values:
+            best_aic = float('inf')
+            best_fit = None
+            best_order = None
+            best_seasonal_order = None
+            
+            for p in p_values:
+                for q in q_values:
+                    order = (p, d, q)
+                    
+                    # Test non-seasonal and seasonal configurations
+                    seasonal_configs = [(0, 0, 0, 0)] if m == 1 else [(P, D, Q, m) for P in seasonal_P for D in seasonal_D for Q in seasonal_Q]
+                    
+                    for seasonal_order in seasonal_configs:
+                        try:
+                            if m == 1 or seasonal_order == (0, 0, 0, 0):
+                                # Non-seasonal ARIMA
+                                model = ARIMA(s, order=order)
+                            else:
+                                # SARIMA with seasonal component
+                                model = SARIMAX(s, order=order, seasonal_order=seasonal_order)
+                            
+                            fitted = model.fit(disp=False)
+                            aic = float(fitted.aic)
+                            err = None
+                        except Exception as e:
+                            fitted = None
+                            aic = float('nan')
+                            err = str(e)
+                        
+                        results.append({
+                            'Commodity': commodity,
+                            'd': d,
+                            'm': m,
+                            'order': order,
+                            'seasonal_order': seasonal_order,
+                            'AIC': aic,
+                            'Status': 'Success' if fitted is not None else 'Failed',
+                            'Error Message': err
+                        })
+                        
+                        if fitted is not None and aic < best_aic:
+                            best_aic = aic
+                            best_fit = fitted
+                            best_order = order
+                            best_seasonal_order = seasonal_order
+            
+            if best_fit is not None:
+                # serialize best_fit to bytes for return
                 try:
-                    model = ARIMA(s, order=order)
-                    fitted = model.fit()
-                    aic = float(fitted.aic)
-                    err = None
-                except Exception as e:
-                    fitted = None
-                    aic = float('nan')
-                    err = str(e)
-                results.append({
-                    'Commodity': commodity,
-                    'd': d,
-                    'm': 1,
-                    'order': order,
-                    'AIC': aic,
-                    'Status': 'Success' if fitted is not None else 'Failed',
-                    'Error Message': err
-                })
-                if fitted is not None and aic < best_aic:
-                    best_aic = aic
-                    best_fit = fitted
-                    best_order = order
-        if best_fit is not None:
-            # serialize best_fit to bytes for return
-            try:
-                best_bytes = _pickle.dumps(best_fit)
-            except Exception:
-                best_bytes = None
-            best_map[d] = (best_order, best_bytes, best_aic)
+                    best_bytes = _pickle.dumps(best_fit)
+                except Exception:
+                    best_bytes = None
+                # Store by (d, m) key
+                best_map[(d, m)] = (best_order, best_seasonal_order, best_bytes, best_aic)
+    
     return (commodity, results, best_map)
 
 
@@ -201,51 +239,76 @@ def _is_flatline(fvals, hist_vals, abs_std_thresh=1e-6, rel_range_thresh=1e-3):
         return False
 
 
-def download_model(commodity, preferred_d=1, prefix='models/arima/'):
-    """Download a saved ARIMA model for `commodity` from GCS.
-    Prefer `preferred_d` and fall back to the other differencing order.
+def download_model(commodity, preferred_d=1, preferred_m=None, prefix='models/arima/'):
+    """Download a saved ARIMA/SARIMA model for `commodity` from GCS.
+    Prefer `preferred_d` and `preferred_m`, fall back to the other differencing order.
+    If preferred_m is None, try to find the best model across all m values.
     Returns tuple (d_used, model_obj) or (None, None) if not found/failed.
     """
     norm = re.sub(r"\s+", '_', commodity)
     bucket = storage_client.bucket(bucket_name)
     # list candidate blobs under prefix and filter by commodity
     blobs = list(bucket.list_blobs(prefix=prefix))
-    # helper to find blob for a given d
-    def _find_blob_for_d(d):
+    
+    # helper to find blob for a given d and m
+    def _find_blob_for_d_m(d, m=None):
+        candidates = []
         for b in blobs:
             name = b.name
             if norm in name and f"_d{d}_" in name and name.endswith('.pkl'):
-                return b
-        # try a looser match (maybe mNone)
-        for b in blobs:
-            name = b.name
-            if norm in name and f"_d{d}" in name and name.endswith('.pkl'):
-                return b
-        return None
+                if m is not None:
+                    if f"_m{m}" in name:
+                        return b
+                else:
+                    # Collect all matches for this d
+                    candidates.append(b)
+        # If no specific m requested, return first match (or None)
+        return candidates[0] if candidates else None
 
-    # try preferred first then fallback
-    for d_try in (preferred_d, 0 if preferred_d == 1 else 1):
-        b = _find_blob_for_d(d_try)
-        if b is None:
-            continue
-        try:
-            data = b.download_as_bytes()
-            obj = pickle.loads(data)
-            return (d_try, obj)
-        except Exception as e:
-            print(f"  Failed to download/unpickle {b.name}: {e}")
-            continue
+    # Try preferred d and m first, then fallback
+    m_tries = [preferred_m] if preferred_m is not None else [1, 75, 125, 250, 375]  # Try non-seasonal first, then seasonal
+    d_tries = [preferred_d, 0 if preferred_d == 1 else 1]
+    
+    for d_try in d_tries:
+        for m_try in m_tries:
+            b = _find_blob_for_d_m(d_try, m_try)
+            if b is None:
+                continue
+            try:
+                data = b.download_as_bytes()
+                obj = pickle.loads(data)
+                return (d_try, obj)
+            except Exception as e:
+                print(f"  Failed to download/unpickle {b.name}: {e}")
+                continue
 
     return (None, None)
 
 
-def generate_and_save_combined_arima_forecast(forecast_steps=52, gcs_prefix='forecast_data/arima_forecast.csv'):
+def generate_and_save_combined_arima_forecast(forecast_steps=250, gcs_prefix='forecast_data/arima_forecast.csv', 
+                                               conf_interval_05=True, conf_interval_10=True):
     """Generate forecasts for all numeric commodities using saved models,
     combine with historical `prices_df`, extend the date index for the forecast
-    horizon and save the combined wide DataFrame to GCS as CSV.
-    Returns the combined DataFrame and the GCS prefix used.
+    horizon and save the combined DataFrame to GCS as CSV.
+    
+    Args:
+        forecast_steps: Number of periods to forecast
+        gcs_prefix: GCS path to save the combined forecast
+        conf_interval_05: If True, calculate 5% confidence intervals (95% confidence)
+        conf_interval_10: If True, calculate 10% confidence intervals (90% confidence)
+    
+    Returns:
+        Tuple of (combined_df, gcs_prefix) where combined_df contains forecasts with confidence intervals
     """
+    # Suppress statsmodels index warnings since we handle dates ourselves
+    warnings.filterwarnings("ignore", category=FutureWarning, message="No supported index is available.*")
+    warnings.filterwarnings("ignore", message="No supported index is available.*")
+    
     forecast_series_dict = {}
+    conf_lower_05_dict = {}  # 5% alpha = 95% confidence interval
+    conf_upper_05_dict = {}
+    conf_lower_10_dict = {}  # 10% alpha = 90% confidence interval
+    conf_upper_10_dict = {}
     arima_forecast_results = []
 
     for commodity in commodity_columns:
@@ -260,24 +323,56 @@ def generate_and_save_combined_arima_forecast(forecast_steps=52, gcs_prefix='for
             d_used, model = download_model(commodity, preferred_d=0)
 
         if model is None:
+            print(f"  {commodity}: No saved model found")
             arima_forecast_results.append({'Commodity': commodity, 'Status': 'NoModel'})
             continue
+        
+        print(f"\n  {commodity}: Initial model loaded with d={d_used}")
 
         try:
+            # Get forecast with confidence intervals
+            conf_int_05 = None
+            conf_int_10 = None
+            
             if hasattr(model, 'forecast'):
                 fvals = model.forecast(forecast_steps)
             elif hasattr(model, 'predict'):
-                # pmdarima .predict may accept n_periods or steps; try with int
                 fvals = model.predict(forecast_steps)
             else:
                 arima_forecast_results.append({'Commodity': commodity, 'Status': 'NoForecastMethod'})
                 continue
+            
+            # Try to get prediction intervals if available
+            # Check if model supports get_forecast for confidence intervals (statsmodels ARIMA)
+            if hasattr(model, 'get_forecast'):
+                try:
+                    forecast_obj = model.get_forecast(steps=forecast_steps)
+                    if conf_interval_05:
+                        conf_int_05 = forecast_obj.conf_int(alpha=0.05)
+                    if conf_interval_10:
+                        conf_int_10 = forecast_obj.conf_int(alpha=0.10)
+                except Exception as e:
+                    print(f"  Could not get confidence intervals for {commodity}: {e}")
+            # Check if pmdarima model with predict and return_conf_int support
+            elif hasattr(model, 'predict'):
+                try:
+                    if conf_interval_05:
+                        _, conf_int_05 = model.predict(n_periods=forecast_steps, return_conf_int=True, alpha=0.05)
+                    if conf_interval_10 and not conf_interval_05:
+                        _, conf_int_10 = model.predict(n_periods=forecast_steps, return_conf_int=True, alpha=0.10)
+                    elif conf_interval_10:
+                        # Need separate call for different alpha
+                        _, conf_int_10 = model.predict(n_periods=forecast_steps, return_conf_int=True, alpha=0.10)
+                except Exception as e:
+                    print(f"  Could not get confidence intervals for {commodity}: {e}")
+                    
         except Exception as e:
             arima_forecast_results.append({'Commodity': commodity, 'Status': 'ForecastFailed', 'Error Message': str(e)})
             continue
 
         # If flatline, force d=0
         if _is_flatline(fvals, series.values) and d_used != 0:
+            print(f"    → Flatline detected! Attempting to switch from d={d_used} to d=0")
             d0, model0 = download_model(commodity, preferred_d=0)
             if model0 is not None:
                 try:
@@ -286,97 +381,240 @@ def generate_and_save_combined_arima_forecast(forecast_steps=52, gcs_prefix='for
                     elif hasattr(model0, 'predict'):
                         fvals = model0.predict(forecast_steps)
                     d_used = 0
+                    model = model0
+                    print(f"    → Successfully switched to d=0 model")
+                    
+                    # Re-calculate confidence intervals with new model
+                    conf_int_05 = None
+                    conf_int_10 = None
+                    if hasattr(model, 'get_forecast'):
+                        try:
+                            forecast_obj = model.get_forecast(steps=forecast_steps)
+                            if conf_interval_05:
+                                conf_int_05 = forecast_obj.conf_int(alpha=0.05)
+                            if conf_interval_10:
+                                conf_int_10 = forecast_obj.conf_int(alpha=0.10)
+                        except Exception:
+                            pass
+                    elif hasattr(model, 'predict'):
+                        try:
+                            if conf_interval_05:
+                                _, conf_int_05 = model.predict(n_periods=forecast_steps, return_conf_int=True, alpha=0.05)
+                            if conf_interval_10:
+                                _, conf_int_10 = model.predict(n_periods=forecast_steps, return_conf_int=True, alpha=0.10)
+                        except Exception:
+                            pass
                 except Exception:
+                    print(f"    → Failed to switch to d=0 model, keeping d={d_used}")
                     pass
+            else:
+                print(f"    → No d=0 model available, keeping d={d_used}")
+        elif _is_flatline(fvals, series.values):
+            print(f"    → Flatline detected (already using d={d_used})")
+        else:
+            print(f"    → Forecast looks good with d={d_used}")
 
-        # Build forecast dates
+        # Build forecast dates using inferred frequency
         try:
             freq = pd.infer_freq(series.index)
         except Exception:
             freq = None
         if freq is None:
-            freq = 'W'
+            # Fallback to daily frequency
+            freq = 'D'
         last_date = series.index[-1]
         forecast_dates = pd.date_range(start=last_date, periods=forecast_steps + 1, freq=freq)[1:]
 
         try:
             forecast_series = pd.Series(np.array(fvals).astype(float), index=forecast_dates)
             forecast_series_dict[commodity] = forecast_series
-            arima_forecast_results.append({'Commodity': commodity, 'Status': 'Success', 'd_used': d_used})
+            
+            # Store confidence intervals if available
+            if conf_int_05 is not None:
+                try:
+                    # Handle different array structures
+                    conf_int_05_array = np.array(conf_int_05)
+                    if conf_int_05_array.ndim == 2:
+                        conf_lower_05_dict[f"{commodity}_lower_05"] = pd.Series(conf_int_05_array[:, 0], index=forecast_dates)
+                        conf_upper_05_dict[f"{commodity}_upper_05"] = pd.Series(conf_int_05_array[:, 1], index=forecast_dates)
+                    elif conf_int_05_array.ndim == 1:
+                        # If 1D, assume it's already lower/upper bounds separately
+                        print(f"  Warning: Unexpected 1D confidence interval structure for {commodity}")
+                except Exception as ci_err:
+                    print(f"  Could not store 5% confidence intervals for {commodity}: {ci_err}")
+            
+            if conf_int_10 is not None:
+                try:
+                    # Handle different array structures
+                    conf_int_10_array = np.array(conf_int_10)
+                    if conf_int_10_array.ndim == 2:
+                        conf_lower_10_dict[f"{commodity}_lower_10"] = pd.Series(conf_int_10_array[:, 0], index=forecast_dates)
+                        conf_upper_10_dict[f"{commodity}_upper_10"] = pd.Series(conf_int_10_array[:, 1], index=forecast_dates)
+                    elif conf_int_10_array.ndim == 1:
+                        print(f"  Warning: Unexpected 1D confidence interval structure for {commodity}")
+                except Exception as ci_err:
+                    print(f"  Could not store 10% confidence intervals for {commodity}: {ci_err}")
+            
+            arima_forecast_results.append({
+                'Commodity': commodity, 
+                'Status': 'Success', 
+                'd_used': d_used,
+                'Has_CI_05': conf_int_05 is not None,
+                'Has_CI_10': conf_int_10 is not None,
+                'Forecast_Start': forecast_dates[0],
+                'Forecast_End': forecast_dates[-1]
+            })
+            print(f"    ✓ Forecast complete using ARIMA model with d={d_used}")
         except Exception as e:
+            print(f"    ✗ Failed to build forecast series: {e}")
             arima_forecast_results.append({'Commodity': commodity, 'Status': 'SeriesBuildFailed', 'Error Message': str(e)})
 
     # Convert results to DataFrame
     arima_forecast_df = pd.DataFrame(arima_forecast_results)
+    print("\n" + "="*80)
+    print("ARIMA Forecast Summary:")
+    print("="*80)
+    print(arima_forecast_df.to_string())
+    print("="*80)
 
     # Prepare historical dataframe of numeric commodities
     historical_df = prices_df[commodity_columns].copy()
 
-    # Prepare forecast wide dataframe
-    if forecast_series_dict:
-        forecast_wide_df = pd.DataFrame(forecast_series_dict)
+    # Prepare forecast wide dataframe including confidence intervals
+    all_forecast_dict = {}
+    all_forecast_dict.update(forecast_series_dict)
+    all_forecast_dict.update(conf_lower_05_dict)
+    all_forecast_dict.update(conf_upper_05_dict)
+    all_forecast_dict.update(conf_lower_10_dict)
+    all_forecast_dict.update(conf_upper_10_dict)
+    
+    if all_forecast_dict:
+        forecast_wide_df = pd.DataFrame(all_forecast_dict)
     else:
         forecast_wide_df = pd.DataFrame(columns=historical_df.columns)
 
     combined_df = pd.concat([historical_df, forecast_wide_df], axis=0, join='outer')
     combined_df.sort_index(inplace=True)
     combined_df.index.name = 'Date'
+    
+    # Reset index to make Date a regular column in the output
+    combined_df_to_save = combined_df.reset_index()
+
+    print(f"\nCombined DataFrame shape: {combined_df.shape}")
+    print(f"Date range: {combined_df.index.min()} to {combined_df.index.max()}")
+    print(f"Historical data points: {len(historical_df)}")
+    print(f"Forecast data points: {len(forecast_wide_df)}")
 
     # Save combined DataFrame to GCS
-    print(f"Saving combined ARIMA forecast results to GCS prefix: {gcs_prefix}")
-    save_dataframe_to_gcs(df=combined_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix, validate_rows=False)
+    print(f"\nSaving combined ARIMA forecast results to GCS prefix: {gcs_prefix}")
+    save_dataframe_to_gcs(df=combined_df_to_save, bucket_name=bucket_name, gcs_prefix=gcs_prefix, validate_rows=False)
 
     return combined_df, gcs_prefix
 
 
 if __name__ == '__main__':
-    # Build per-commodity tasks
-    tasks = []
-    for commodity in commodity_columns:
-        series = prices_df[commodity].dropna()
-        if series.empty:
-            print(f"  Skipping {commodity}: empty after dropna")
-            continue
-        tasks.append((commodity, series.values, series.index.astype(str).tolist()))
+    print("\n" + "="*80)
+    print("ARIMA FORECASTING WORKFLOW")
+    print("="*80)
+    
+    # Ask user if they want to load saved models or run tests
+    print("\nDo you want to:")
+    print("  1. Load saved models from GCS (faster)")
+    print("  2. Run new ARIMA grid search and train models (slower, more accurate)")
+    
+    user_choice = input("\nEnter your choice (1 or 2): ").strip()
+    
+    if user_choice == '2':
+        print("\n" + "="*80)
+        print("Running ARIMA Grid Search and Model Training")
+        print("="*80)
+        
+        # Build per-commodity tasks
+        tasks = []
+        for commodity in commodity_columns:
+            series = prices_df[commodity].dropna()
+            if series.empty:
+                print(f"  Skipping {commodity}: empty after dropna")
+                continue
+            tasks.append((commodity, series.values, series.index.astype(str).tolist()))
 
-    # Run per-commodity grid in parallel using processes
-    max_workers = max(1, (os.cpu_count() or 1) - 1)
-    print(f"Running per-commodity ARIMA grid using {max_workers} processes...")
-    import pickle as _pickle
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(_commodity_grid_worker, t): t for t in tasks}
-        for fut in as_completed(futures):
-            commodity, eval_rows, best_map_ser = fut.result()
-            # append evaluations
-            arima_evaluation_results.extend(eval_rows)
-            # reconstruct best models
-            best_models[commodity] = {}
-            for d_val, (order, best_bytes, aic) in best_map_ser.items():
+        # Run per-commodity grid in parallel using processes
+        max_workers = max(1, (os.cpu_count() or 1) - 1)
+        print(f"\nRunning per-commodity ARIMA grid using {max_workers} processes...")
+        import pickle as _pickle
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = {executor.submit(_commodity_grid_worker, t): t for t in tasks}
+            for fut in as_completed(futures):
+                commodity, eval_rows, best_map_ser = fut.result()
+                # append evaluations
+                arima_evaluation_results.extend(eval_rows)
+                # reconstruct best models
+                best_models[commodity] = {}
+                for (d_val, m_val), (order, seasonal_order, best_bytes, aic) in best_map_ser.items():
+                    try:
+                        model_fit = _pickle.loads(best_bytes) if best_bytes is not None else None
+                    except Exception:
+                        model_fit = None
+                    if model_fit is not None:
+                        best_models[commodity][(d_val, m_val)] = (order, seasonal_order, model_fit, aic)
+
+        # Convert to DataFrame
+        arima_evaluation_df = pd.DataFrame(arima_evaluation_results)
+        print("\nARIMA Evaluation Results DataFrame Head:")
+        print(arima_evaluation_df.head())
+
+        # Save best models per commodity/d/m to GCS
+        arima_fitted_models = {}
+        print("\nSaving selected best-fit ARIMA/SARIMA models to GCS...")
+        for commodity, dmap in best_models.items():
+            arima_fitted_models[commodity] = {}
+            for (d_val, m_val), (order, seasonal_order, model_fit, aic) in dmap.items():
                 try:
-                    model_fit = _pickle.loads(best_bytes) if best_bytes is not None else None
-                except Exception:
-                    model_fit = None
-                if model_fit is not None:
-                    best_models[commodity][d_val] = (order, model_fit, aic)
-
-    # Convert to DataFrame
-    arima_evaluation_df = pd.DataFrame(arima_evaluation_results)
-    print("\nARIMA Evaluation Results DataFrame Head:")
-    print(arima_evaluation_df.head())
-
-    # Save best models per commodity/d to GCS
-    arima_fitted_models = {}
-    print("\nSaving selected best-fit ARIMA models to GCS...")
-    for commodity, dmap in best_models.items():
-        arima_fitted_models[commodity] = {}
-        for d_val, (order, model_fit, aic) in dmap.items():
-            try:
-                key = _gcs_save_model(model_fit, commodity, prefix='models/arima/', d_override=d_val, m_override=1)
-                if key:
-                    print(f"  Saved {commodity} d={d_val} order={order} AIC={aic} -> {key}")
-                arima_fitted_models[commodity][d_val] = model_fit
-            except Exception as e:
-                print(f"  Failed to save selected model for {commodity} d={d_val}: {e}")
+                    key = _gcs_save_model(model_fit, commodity, prefix='models/arima/', d_override=d_val, m_override=m_val)
+                    if key:
+                        model_type = "SARIMA" if m_val > 1 else "ARIMA"
+                        print(f"  Saved {commodity} {model_type} d={d_val} m={m_val} order={order} seasonal={seasonal_order} AIC={aic:.2f} -> {key}")
+                    arima_fitted_models[commodity][(d_val, m_val)] = model_fit
+                except Exception as e:
+                    print(f"  Failed to save selected model for {commodity} d={d_val} m={m_val}: {e}")
+        
+        print("\n" + "="*80)
+        print("Model Training Complete")
+        print("="*80)
+    
+    elif user_choice == '1':
+        print("\n" + "="*80)
+        print("Loading Saved Models from GCS")
+        print("="*80)
+        print("Models will be loaded during forecasting...")
+    
+    else:
+        print("\nInvalid choice. Defaulting to loading saved models.")
+        user_choice = '1'
+    
+    # Generate forecasts with confidence intervals
+    print("\n" + "="*80)
+    print("Generating Forecasts with Confidence Intervals")
+    print("="*80)
+    
+    forecast_steps = int(input("\nEnter number of forecast periods (default 250): ").strip() or "250")
+    
+    print(f"\nGenerating {forecast_steps}-step forecast with 5% and 10% confidence intervals...")
+    combined_df, gcs_prefix = generate_and_save_combined_arima_forecast(
+        forecast_steps=forecast_steps,
+        gcs_prefix='forecast_data/arima_forecast.csv',
+        conf_interval_05=True,
+        conf_interval_10=True
+    )
+    
+    print("\n" + "="*80)
+    print("ARIMA Forecasting Workflow Complete")
+    print("="*80)
+    print(f"\nResults saved to GCS: {gcs_prefix}")
+    print(f"Combined DataFrame shape: {combined_df.shape}")
+    print(f"\nColumns in output:")
+    for col in combined_df.columns:
+        print(f"  - {col}")
 
 # # ==============================================================================
 # # Select best models (by AIC) and forecast using selected orders
