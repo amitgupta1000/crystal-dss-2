@@ -737,47 +737,64 @@ if __name__ == '__main__':
         print("="*80)
         
         # Build simplified configuration: non-seasonal ARIMA plus small seasonal probe
+        sarimax_choice = input("\nEnable seasonal SARIMAX exploration? (y/N): ").strip().lower()
+        enable_sarimax = sarimax_choice in ("y", "yes")
+
         print("\n" + "="*80)
         print("ARIMA PARAMETER CONFIGURATION")
         print("="*80)
-        print("Running non-seasonal ARIMA (seasonal exploration disabled)")
-        print("d range: [0, 1] | max_p=3 | max_q=3")
-        print("\nBENEFITS: Faster convergence and lower risk of auto_arima hangs")
-        print("          Seasonality can be re-enabled once stability is confirmed")
+
+        if enable_sarimax:
+            print("Running seasonal SARIMAX probe workflow alongside non-seasonal baselines")
+            print("d range: [0, 1] | max_p=3 | max_q=3")
+            print("Seasonal periods derived from seasonality study; probes will extrapolate configs")
+        else:
+            print("Running non-seasonal ARIMA (seasonal exploration disabled)")
+            print("d range: [0, 1] | max_p=3 | max_q=3")
+            print("\nBENEFITS: Faster convergence and lower risk of auto_arima hangs")
+            print("          Seasonality can be re-enabled once stability is confirmed")
 
         series_length_map = {
             commodity: len(prices_df[commodity].dropna())
             for commodity in commodity_columns
         }
 
-        seasonality_map = load_seasonality_study()
-        commodity_m_map = build_commodity_m_mapping(
-            commodity_columns,
-            seasonality_map,
-            series_length_map=series_length_map,
-        )
+        commodity_m_map = {commodity: [1] for commodity in commodity_columns}
+        probe_commodities = []
+        rest_commodities = []
+        extrapolated_config_cap = 0
 
-        eligible_for_probe = [
-            commodity for commodity in commodity_columns
-            if len(commodity_m_map.get(commodity, [1])) > 1
-        ]
+        if enable_sarimax:
+            seasonality_map = load_seasonality_study()
+            commodity_m_map = build_commodity_m_mapping(
+                commodity_columns,
+                seasonality_map,
+                series_length_map=series_length_map,
+            )
 
-        probe_commodities = choose_seasonal_probe_commodities(
-            series_length_map,
-            eligible_commodities=eligible_for_probe,
-        )
-        rest_commodities = [c for c in commodity_columns if c not in probe_commodities]
+            eligible_for_probe = [
+                commodity for commodity in commodity_columns
+                if len(commodity_m_map.get(commodity, [1])) > 1
+            ]
 
-        try:
-            extrapolated_config_cap = max(1, int(os.getenv("SARIMAX_MAX_CONFIGS", "1")))
-        except ValueError:
-            extrapolated_config_cap = 1
+            probe_commodities = choose_seasonal_probe_commodities(
+                series_length_map,
+                eligible_commodities=eligible_for_probe,
+            )
+            rest_commodities = [c for c in commodity_columns if c not in probe_commodities]
 
-        if probe_commodities:
-            print(f"\nSeasonal SARIMAX probes ({len(probe_commodities)}): {', '.join(probe_commodities)}")
-            print(f"Using probe results to extrapolate up to {extrapolated_config_cap} seasonal configuration(s) to remaining commodities")
+            try:
+                extrapolated_config_cap = max(1, int(os.getenv("SARIMAX_MAX_CONFIGS", "1")))
+            except ValueError:
+                extrapolated_config_cap = 1
+
+            if probe_commodities:
+                print(f"\nSeasonal SARIMAX probes ({len(probe_commodities)}): {', '.join(probe_commodities)}")
+                print(f"Using probe results to extrapolate up to {extrapolated_config_cap} seasonal configuration(s) to remaining commodities")
+            else:
+                print("\nNo eligible commodities selected for seasonal probing; proceeding non-seasonal for all.")
         else:
-            print("\nNo eligible commodities selected for seasonal probing; proceeding non-seasonal for all.")
+            print("\nSeasonal SARIMAX exploration disabled; proceeding non-seasonal for all commodities.")
         
         # Build per-commodity tasks with optimized m_values
         tasks = []
