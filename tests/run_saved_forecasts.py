@@ -10,7 +10,7 @@ import re
 # Import helpers from main module
 import os, sys
 sys.path.insert(0, os.getcwd())
-from dss_main import download_model, _is_flatline, commodity_columns, prices_df
+from dss_forecaster import download_model, _is_flatline, commodity_columns, prices_df
 
 creds, _ = default()
 client = storage.Client(credentials=creds)
