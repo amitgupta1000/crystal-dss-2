@@ -93,34 +93,15 @@ def load_seasonality_study(gcs_path='stats_studies_data/seasonality/seasonality_
         return {}
 
 
-def get_robust_m_values(period, standard_periods=[52, 75, 130, 156, 195, 250, 312, 390, 520, 781]):
+def get_primary_seasonal_m(period):
     """
-    Given a detected seasonal period, return a list of m values to test including:
-    - 1 (non-seasonal baseline)
-    - The detected period itself
-    - Nearest standard periods for robustness
-    
-    Args:
-        period: The detected seasonal period from the study
-        standard_periods: List of standard seasonal periods to consider
-    
-    Returns:
-        list: Optimized list of m values to test
+    Return the single strongest seasonal period identified for the commodity.
     """
-    m_values = [1, period]  # Always include non-seasonal and detected period
-    
-    # Find nearest standard periods (within 20% of detected period)
-    tolerance = 0.20
-    for std_period in standard_periods:
-        if std_period == period:
-            continue  # Already included
-        ratio = abs(std_period - period) / period
-        if ratio <= tolerance:
-            m_values.append(std_period)
-    
-    # Remove duplicates and sort
-    m_values = sorted(list(set(m_values)))
-    return m_values
+    try:
+        period_int = int(round(period))
+        return [max(period_int, 1)]
+    except Exception:
+        return [1]
 
 
 def build_commodity_m_mapping(commodity_columns, seasonality_map):
@@ -135,12 +116,12 @@ def build_commodity_m_mapping(commodity_columns, seasonality_map):
         dict: Mapping of commodity to list of m values to test
     """
     commodity_m_map = {}
-    default_m_values = [75]  # Fallback for commodities not in study
+    default_m_values = [1]  # Fallback (run non-seasonal ARIMA)
     
     for commodity in commodity_columns:
         if commodity in seasonality_map:
             period = seasonality_map[commodity]
-            m_values = get_robust_m_values(period)
+            m_values = get_primary_seasonal_m(period)
             commodity_m_map[commodity] = m_values
         else:
             # Use default for commodities not in seasonality study
@@ -356,14 +337,17 @@ def download_model(commodity, preferred_d=1, preferred_m=None, prefix='models/ar
 
     return (None, None)
 
-
-def generate_and_save_combined_arima_forecast(forecast_steps=250, gcs_prefix='forecast_data/arima_forecast.csv', 
+2
+def generate_and_save_combined_arima_forecast(prices_df, commodity_columns, forecast_steps=250, 
+                                               gcs_prefix='forecast_data/arima_forecast.csv', 
                                                conf_interval_05=True, conf_interval_10=True):
     """Generate forecasts for all numeric commodities using saved models,
     combine with historical `prices_df`, extend the date index for the forecast
     horizon and save the combined DataFrame to GCS as CSV.
     
     Args:
+        prices_df: DataFrame with historical prices
+        commodity_columns: List of commodity column names to forecast
         forecast_steps: Number of periods to forecast
         gcs_prefix: GCS path to save the combined forecast
         conf_interval_05: If True, calculate 5% confidence intervals (95% confidence)
@@ -595,6 +579,38 @@ if __name__ == '__main__':
     print("  2. Run new ARIMA grid search and train models (slower, more accurate)")
     
     user_choice = input("\nEnter your choice (1 or 2): ").strip()
+
+    # Load latest cleaned prices once for both pathways
+    print("\n" + "="*80)
+    print("LOADING PRICE DATA FROM GCS")
+    print("="*80)
+    try:
+        prices_df = download_latest_csv_from_gcs(bucket_name=bucket_name, gcs_prefix='cleaned_data')
+        print("  ✓ Downloaded latest cleaned DataFrame from GCS")
+    except Exception as e:
+        raise RuntimeError(f"Failed to load cleaned price data from GCS: {e}")
+
+    prices_df = prices_df.copy()
+
+    if 'date' in prices_df.columns:
+        prices_df['date'] = pd.to_datetime(prices_df['date'], format='%d-%m-%y', errors='coerce')
+        prices_df.dropna(subset=['date'], inplace=True)
+        prices_df.set_index('date', inplace=True)
+        prices_df.index.name = 'Date'
+    else:
+        raise RuntimeError("Expected 'date' column not found in cleaned price data")
+
+    prices_df.columns = prices_df.columns.str.strip()
+    prices_df.sort_index(ascending=True, inplace=True)
+    prices_df.dropna(axis=1, how='all', inplace=True)
+    prices_df.dropna(axis=0, how='all', inplace=True)
+
+    commodity_columns = [col for col in prices_df.columns if pd.api.types.is_numeric_dtype(prices_df[col])]
+
+    if not commodity_columns:
+        raise RuntimeError("No numeric commodity columns found in cleaned price data")
+
+    print(f"  ✓ Price data prepared. Rows: {prices_df.shape[0]} | Commodities: {len(commodity_columns)}")
     
     if user_choice == '2':
         print("\n" + "="*80)
@@ -623,10 +639,10 @@ if __name__ == '__main__':
         print(f"Using pmdarima auto_arima for intelligent model selection (much faster!)")
         print(f"Non-seasonal: d=[0,1], p/q auto-selected (max_p=3, max_q=3)")
         print(f"Seasonal: D auto-selected, P/Q auto-selected (max_P=2, max_Q=2)")
-        print(f"m_values: Commodity-specific based on empirical seasonality analysis")
+        print(f"Seasonal period: single strongest period per commodity (from study)")
         print(f"\nEstimated search time per commodity: 10-30 seconds (vs 5-10 minutes with grid)")
         for commodity in sorted(commodity_columns)[:5]:  # Show first 5 as examples
-            m_vals = commodity_m_map.get(commodity, [1, 75, 250])
+            m_vals = commodity_m_map.get(commodity, [1])
             print(f"  {commodity:20s}: m={m_vals}")
         print(f"  ... (see full list above)")
         print(f"\nBENEFITS: Stepwise search + empirically-detected periods = fast & accurate")
@@ -639,12 +655,18 @@ if __name__ == '__main__':
             if series.empty:
                 print(f"  Skipping {commodity}: empty after dropna")
                 continue
-            m_values_for_commodity = commodity_m_map.get(commodity, [1, 75, 250])
+            m_values_for_commodity = commodity_m_map.get(commodity, [1])
             tasks.append((commodity, series.values, series.index.astype(str).tolist(), m_values_for_commodity))
 
-        # Run per-commodity grid in parallel using processes
-        max_workers = max(1, (os.cpu_count() or 1) - 1)
-        print(f"\nRunning per-commodity auto_arima using {max_workers} processes...")
+        # Initialize results and models containers
+        arima_evaluation_results = []
+        best_models = {}
+
+        # Run per-commodity auto_arima in parallel (bounded workers to avoid overload)
+        cpu_based_workers = max(1, (os.cpu_count() or 1) - 1)
+        configured_cap = int(os.getenv("ARIMA_MAX_WORKERS", "8"))
+        max_workers = max(1, min(cpu_based_workers, configured_cap))
+        print(f"\nRunning per-commodity auto_arima using {max_workers} processes (cap={configured_cap})...")
         import pickle as _pickle
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_commodity_auto_arima_worker, t): t for t in tasks}
@@ -705,6 +727,8 @@ if __name__ == '__main__':
     
     print(f"\nGenerating {forecast_steps}-step forecast with 5% and 10% confidence intervals...")
     combined_df, gcs_prefix = generate_and_save_combined_arima_forecast(
+        prices_df=prices_df,
+        commodity_columns=commodity_columns,
         forecast_steps=forecast_steps,
         gcs_prefix='forecast_data/arima_forecast.csv',
         conf_interval_05=True,
