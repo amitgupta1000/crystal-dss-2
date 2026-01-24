@@ -10,7 +10,6 @@ from dotenv import load_dotenv
 import pandas as pd
 import numpy as np
 import warnings
-import pmdarima as pm
 from statsmodels.tsa.arima.model import ARIMA
 from sklearn.model_selection import train_test_split
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -87,22 +86,111 @@ if 'prices_df' in locals():
 else:
     print("prices_df DataFrame is not loaded. Cannot proceed.")
 
-# ARIMA/SARIMA grid testing framework
-p_values = [0, 1, 2]
-q_values = [0, 1, 2]
-ds = [0, 1]
-# Seasonal periods: 75≈quarterly(weekly data), 125≈semi-annual, 250≈annual, 375≈1.5 year
-m_values = [1, 75, 250]  # 1 = non-seasonal ARIMA
-# Simple seasonal parameters (only test when m > 1)
-seasonal_P = [0, 1]
-seasonal_D = [0, 1]
-seasonal_Q = [0, 1]
+#==================================#============================================
+# SEASONALITY-GUIDED ARIMA PARAMETER OPTIMIZATION
+#==================================#============================================
 
-print("Using ARIMA/SARIMA grid:")
-print(f"  Non-seasonal: p={p_values}, d={ds}, q={q_values}")
-print(f"  Seasonal: P={seasonal_P}, D={seasonal_D}, Q={seasonal_Q}, m={m_values}")
-print(f"  Estimated models per commodity: {len(p_values) * len(q_values) * len(ds) * (1 + len(seasonal_P) * len(seasonal_D) * len(seasonal_Q) * (len(m_values) - 1))}")
-print(f"  Note: Adding seasonality will increase fitting time approximately 8-10x")
+def load_seasonality_study(gcs_path='stats_studies_data/seasonality/seasonality_results_20260123.csv'):
+    """
+    Load seasonality study results from GCS and extract the strongest seasonal period
+    for each commodity.
+    
+    Returns:
+        dict: Mapping of commodity name to best seasonal period (m value)
+    """
+    try:
+        print(f"\nLoading seasonality study from GCS: {gcs_path}")
+        bucket = storage_client.bucket(bucket_name)
+        blob = bucket.blob(gcs_path)
+        data = blob.download_as_bytes()
+        seasonality_df = pd.read_csv(io.BytesIO(data))
+        
+        # Filter for seasonal periods only
+        seasonal_only = seasonality_df[seasonality_df['Is Seasonal for Period'] == True].copy()
+        
+        if seasonal_only.empty:
+            print("  Warning: No seasonal periods found in study")
+            return {}
+        
+        # Get the period with highest seasonality strength for each commodity
+        best_periods = seasonal_only.loc[
+            seasonal_only.groupby('Commodity')['Seasonality Strength (STL)'].idxmax()
+        ]
+        
+        # Create mapping: commodity -> best period
+        seasonality_map = dict(zip(
+            best_periods['Commodity'], 
+            best_periods['Period'].astype(int)
+        ))
+        
+        print(f"  ✓ Loaded seasonality data for {len(seasonality_map)} commodities")
+        return seasonality_map
+    
+    except Exception as e:
+        print(f"  ✗ Failed to load seasonality study: {e}")
+        print(f"  Falling back to default m_values")
+        return {}
+
+
+def get_robust_m_values(period, standard_periods=[52, 75, 130, 156, 195, 250, 312, 390, 520, 781]):
+    """
+    Given a detected seasonal period, return a list of m values to test including:
+    - 1 (non-seasonal baseline)
+    - The detected period itself
+    - Nearest standard periods for robustness
+    
+    Args:
+        period: The detected seasonal period from the study
+        standard_periods: List of standard seasonal periods to consider
+    
+    Returns:
+        list: Optimized list of m values to test
+    """
+    m_values = [1, period]  # Always include non-seasonal and detected period
+    
+    # Find nearest standard periods (within 20% of detected period)
+    tolerance = 0.20
+    for std_period in standard_periods:
+        if std_period == period:
+            continue  # Already included
+        ratio = abs(std_period - period) / period
+        if ratio <= tolerance:
+            m_values.append(std_period)
+    
+    # Remove duplicates and sort
+    m_values = sorted(list(set(m_values)))
+    return m_values
+
+
+def build_commodity_m_mapping(commodity_columns, seasonality_map):
+    """
+    Build a mapping of commodity to optimized m_values based on seasonality study.
+    
+    Args:
+        commodity_columns: List of commodity column names from prices_df
+        seasonality_map: Dict mapping commodity names to best seasonal periods
+    
+    Returns:
+        dict: Mapping of commodity to list of m values to test
+    """
+    commodity_m_map = {}
+    default_m_values = [75]  # Fallback for commodities not in study
+    
+    for commodity in commodity_columns:
+        if commodity in seasonality_map:
+            period = seasonality_map[commodity]
+            m_values = get_robust_m_values(period)
+            commodity_m_map[commodity] = m_values
+        else:
+            # Use default for commodities not in seasonality study
+            commodity_m_map[commodity] = default_m_values
+    
+    return commodity_m_map
+
+
+#==================================#============================================
+# ARIMA/SARIMA grid testing framework
+#==================================#============================================
 
 arima_evaluation_results = []
 best_models = {}
@@ -110,10 +198,20 @@ best_models = {}
 # Identify numeric columns to use as commodity columns
 commodity_columns = [col for col in prices_df.columns if pd.api.types.is_numeric_dtype(prices_df[col])]
 
+# ARIMA/SARIMA parameters (seasonality will be loaded if needed during grid search)
+p_values = [0, 1, 2]
+q_values = [0, 1, 2]
+ds = [0, 1]
+# m_values determined per-commodity based on seasonality study (loaded during grid search)
+# Simple seasonal parameters (only test when m > 1)
+seasonal_P = [0, 1]
+seasonal_D = [0, 1]
+seasonal_Q = [0, 1]
+
 
 def _commodity_grid_worker(task):
-    # task: (commodity, values, index_iso)
-    commodity, values, index_iso = task
+    # task: (commodity, values, index_iso, m_values_for_commodity)
+    commodity, values, index_iso, m_values_for_commodity = task
     import pandas as _pd
     import pickle as _pickle
     from statsmodels.tsa.statespace.sarimax import SARIMAX
@@ -122,7 +220,7 @@ def _commodity_grid_worker(task):
     s = _pd.Series(values, index=_pd.to_datetime(index_iso))
     
     for d in ds:
-        for m in m_values:
+        for m in m_values_for_commodity:
             best_aic = float('inf')
             best_fit = None
             best_order = None
@@ -529,14 +627,46 @@ if __name__ == '__main__':
         print("Running ARIMA Grid Search and Model Training")
         print("="*80)
         
-        # Build per-commodity tasks
+        # Load seasonality study and build optimized m_values mapping
+        print("\n" + "="*80)
+        print("SEASONALITY-GUIDED PARAMETER OPTIMIZATION")
+        print("="*80)
+        seasonality_map = load_seasonality_study()
+        commodity_m_map = build_commodity_m_mapping(commodity_columns, seasonality_map)
+
+        # Display optimization results
+        print("\nOptimized m_values per commodity:")
+        for commodity, m_vals in sorted(commodity_m_map.items()):
+            if commodity in seasonality_map:
+                detected_period = seasonality_map[commodity]
+                print(f"  {commodity:20s}: m={m_vals} (detected period: {detected_period})")
+            else:
+                print(f"  {commodity:20s}: m={m_vals} (using defaults)")
+
+        print("\n" + "="*80)
+        print("ARIMA/SARIMA GRID SEARCH CONFIGURATION")
+        print("="*80)
+        print(f"Non-seasonal parameters: p={p_values}, d={ds}, q={q_values}")
+        print(f"Seasonal parameters: P={seasonal_P}, D={seasonal_D}, Q={seasonal_Q}")
+        print(f"m_values: Commodity-specific based on empirical seasonality analysis")
+        print(f"\nEstimated models per commodity (varies by detected seasonality):")
+        for commodity in sorted(commodity_columns)[:5]:  # Show first 5 as examples
+            m_vals = commodity_m_map.get(commodity, [1, 75, 250])
+            est_models = len(p_values) * len(q_values) * len(ds) * (1 + len(seasonal_P) * len(seasonal_D) * len(seasonal_Q) * (len(m_vals) - 1))
+            print(f"  {commodity:20s}: ~{est_models} models (m={m_vals})")
+        print(f"  ... (see full list above)")
+        print(f"\nBENEFITS: Empirically-detected periods yield better fits than arbitrary quarterly/annual")
+        print(f"          Grid size similar but focused on data-driven seasonal periods")
+        
+        # Build per-commodity tasks with optimized m_values
         tasks = []
         for commodity in commodity_columns:
             series = prices_df[commodity].dropna()
             if series.empty:
                 print(f"  Skipping {commodity}: empty after dropna")
                 continue
-            tasks.append((commodity, series.values, series.index.astype(str).tolist()))
+            m_values_for_commodity = commodity_m_map.get(commodity, [1, 75, 250])
+            tasks.append((commodity, series.values, series.index.astype(str).tolist(), m_values_for_commodity))
 
         # Run per-commodity grid in parallel using processes
         max_workers = max(1, (os.cpu_count() or 1) - 1)
