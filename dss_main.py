@@ -93,41 +93,161 @@ def load_seasonality_study(gcs_path='stats_studies_data/seasonality/seasonality_
         return {}
 
 
-def get_primary_seasonal_m(period):
+def get_primary_seasonal_m(period, *, series_length=None, max_seasonal_period=None):
     """
-    Return the single strongest seasonal period identified for the commodity.
+    Return the strongest seasonal period identified for the commodity, constrained by
+    data availability and an optional upper bound. Always includes 1 as a fallback so
+    a non-seasonal ARIMA is evaluated alongside any seasonal candidate.
     """
+    if max_seasonal_period is None:
+        env_cap = os.getenv("ARIMA_MAX_SEASONAL_PERIOD")
+        try:
+            max_seasonal_period = max(1, int(env_cap)) if env_cap is not None else 120
+        except ValueError:
+            max_seasonal_period = 120
+
     try:
-        period_int = int(round(period))
-        return [max(period_int, 1)]
+        seasonal_candidate = max(1, int(round(period)))
     except Exception:
-        return [1]
+        seasonal_candidate = 1
+
+    if max_seasonal_period:
+        seasonal_candidate = min(seasonal_candidate, max_seasonal_period)
+
+    if series_length is not None:
+        max_supported = max(1, series_length // 2)
+        if max_supported <= 1:
+            seasonal_candidate = 1
+        else:
+            seasonal_candidate = min(seasonal_candidate, max_supported)
+
+    m_values = {1}
+    if seasonal_candidate > 1:
+        m_values.add(seasonal_candidate)
+    return sorted(m_values)
 
 
-def build_commodity_m_mapping(commodity_columns, seasonality_map):
+def build_commodity_m_mapping(commodity_columns, seasonality_map, *, series_length_map=None, max_seasonal_period=None):
     """
-    Build a mapping of commodity to optimized m_values based on seasonality study.
-    
-    Args:
-        commodity_columns: List of commodity column names from prices_df
-        seasonality_map: Dict mapping commodity names to best seasonal periods
-    
-    Returns:
-        dict: Mapping of commodity to list of m values to test
+    Build a mapping of commodity to optimized m_values based on seasonality study,
+    capping seasonal periods to avoid runaway auto_arima fits.
     """
     commodity_m_map = {}
     default_m_values = [1]  # Fallback (run non-seasonal ARIMA)
-    
+
     for commodity in commodity_columns:
+        series_len = None
+        if series_length_map:
+            series_len = series_length_map.get(commodity)
+
         if commodity in seasonality_map:
             period = seasonality_map[commodity]
-            m_values = get_primary_seasonal_m(period)
+            m_values = get_primary_seasonal_m(
+                period,
+                series_length=series_len,
+                max_seasonal_period=max_seasonal_period,
+            )
+
+            original_period = None
+            try:
+                original_period = int(round(period))
+            except Exception:
+                original_period = None
+
+            seasonal_only = [m for m in m_values if m > 1]
+            if original_period and seasonal_only:
+                capped_value = seasonal_only[-1]
+                if capped_value != original_period:
+                    print(
+                        f"  -> {commodity}: capped seasonal period from {original_period} to {capped_value} "
+                        f"(max={max_seasonal_period or '120'}, len={series_len})"
+                    )
+            elif original_period and not seasonal_only:
+                print(
+                    f"  -> {commodity}: insufficient history for seasonal period {original_period}; using m=1"
+                )
+
             commodity_m_map[commodity] = m_values
         else:
-            # Use default for commodities not in seasonality study
             commodity_m_map[commodity] = default_m_values
-    
+
     return commodity_m_map
+
+
+def choose_seasonal_probe_commodities(series_length_map, eligible_commodities=None, default_probe_size=3):
+    """Select a small subset of commodities for seasonal SARIMAX probing."""
+    if not series_length_map:
+        return []
+
+    manual = os.getenv("SARIMAX_PROBE_INCLUDE")
+    if manual:
+        requested = [c.strip() for c in manual.split(',') if c.strip()]
+        if eligible_commodities is not None:
+            requested = [c for c in requested if c in eligible_commodities]
+        return requested
+
+    try:
+        probe_size_env = os.getenv("SARIMAX_PROBE_SIZE")
+        probe_size = max(0, int(probe_size_env)) if probe_size_env else default_probe_size
+    except ValueError:
+        probe_size = default_probe_size
+
+    candidates = []
+    for name, length in series_length_map.items():
+        if length and (eligible_commodities is None or name in eligible_commodities):
+            candidates.append((name, length))
+
+    candidates.sort(key=lambda kv: kv[1], reverse=True)
+    return [name for name, _ in candidates[:probe_size]]
+
+
+def derive_extrapolated_seasonal_configs(arima_eval_df, probe_commodities, max_configs=1):
+    """Derive top seasonal configurations from probe commodities for extrapolation."""
+    if not probe_commodities or arima_eval_df.empty:
+        return []
+
+    probe_mask = arima_eval_df['Commodity'].isin(probe_commodities)
+    success_mask = arima_eval_df['Status'].isin(['Success', 'Success-Extrapolated'])
+    seasonal_mask = arima_eval_df['m'] > 1
+    filtered = arima_eval_df[probe_mask & success_mask & seasonal_mask].copy()
+    filtered = filtered[filtered['seasonal_order'].notna()]
+
+    if filtered.empty:
+        return []
+
+    filtered['order_tuple'] = filtered['order'].apply(
+        lambda val: tuple(val) if isinstance(val, (list, tuple)) else tuple(val)
+    )
+    filtered['seasonal_order_tuple'] = filtered['seasonal_order'].apply(
+        lambda val: tuple(val) if isinstance(val, (list, tuple)) else tuple(val)
+    )
+
+    grouped = (
+        filtered.groupby(['order_tuple', 'seasonal_order_tuple'])['AIC']
+        .mean()
+        .reset_index()
+        .rename(columns={'AIC': 'mean_aic'})
+        .sort_values('mean_aic')
+    )
+
+    try:
+        max_configs = max(1, int(max_configs))
+    except (TypeError, ValueError):
+        max_configs = 1
+
+    configs = []
+    for _, row in grouped.head(max_configs).iterrows():
+        order_tuple = tuple(row['order_tuple'])
+        seasonal_tuple = tuple(row['seasonal_order_tuple'])
+        if len(seasonal_tuple) < 4 or seasonal_tuple[3] <= 0:
+            continue
+        configs.append({
+            'order': order_tuple,
+            'seasonal_order': seasonal_tuple,
+            'mean_aic': float(row['mean_aic'])
+        })
+
+    return configs
 
 
 #==================================#============================================
@@ -164,8 +284,8 @@ def _commodity_auto_arima_worker(task):
                     model = auto_arima(
                         s,
                         d=d,  # Fix differencing order
-                        start_p=0, max_p=3,
-                        start_q=0, max_q=3,
+                        start_p=0, max_p=2,
+                        start_q=0, max_q=2,
                         seasonal=False,
                         stepwise=True,
                         suppress_warnings=True,
@@ -179,12 +299,12 @@ def _commodity_auto_arima_worker(task):
                     model = auto_arima(
                         s,
                         d=d,  # Fix differencing order
-                        start_p=0, max_p=3,
-                        start_q=0, max_q=3,
+                        start_p=0, max_p=2,
+                        start_q=0, max_q=2,
                         seasonal=True,
                         m=m,  # Use detected seasonal period
-                        start_P=0, max_P=2,
-                        start_Q=0, max_Q=2,
+                        start_P=0, max_P=1,
+                        start_Q=0, max_Q=1,
                         D=None,  # Let auto_arima choose seasonal differencing
                         stepwise=True,
                         suppress_warnings=True,
@@ -337,7 +457,6 @@ def download_model(commodity, preferred_d=1, preferred_m=None, prefix='models/ar
 
     return (None, None)
 
-2
 def generate_and_save_combined_arima_forecast(prices_df, commodity_columns, forecast_steps=250, 
                                                gcs_prefix='forecast_data/arima_forecast.csv', 
                                                conf_interval_05=True, conf_interval_10=True):
@@ -617,45 +736,61 @@ if __name__ == '__main__':
         print("Running ARIMA Grid Search and Model Training")
         print("="*80)
         
-        # Load seasonality study and build optimized m_values mapping
+        # Build simplified configuration: non-seasonal ARIMA plus small seasonal probe
         print("\n" + "="*80)
-        print("SEASONALITY-GUIDED PARAMETER OPTIMIZATION")
+        print("ARIMA PARAMETER CONFIGURATION")
         print("="*80)
+        print("Running non-seasonal ARIMA (seasonal exploration disabled)")
+        print("d range: [0, 1] | max_p=3 | max_q=3")
+        print("\nBENEFITS: Faster convergence and lower risk of auto_arima hangs")
+        print("          Seasonality can be re-enabled once stability is confirmed")
+
+        series_length_map = {
+            commodity: len(prices_df[commodity].dropna())
+            for commodity in commodity_columns
+        }
+
         seasonality_map = load_seasonality_study()
-        commodity_m_map = build_commodity_m_mapping(commodity_columns, seasonality_map)
+        commodity_m_map = build_commodity_m_mapping(
+            commodity_columns,
+            seasonality_map,
+            series_length_map=series_length_map,
+        )
 
-        # Display optimization results
-        print("\nOptimized m_values per commodity:")
-        for commodity, m_vals in sorted(commodity_m_map.items()):
-            if commodity in seasonality_map:
-                detected_period = seasonality_map[commodity]
-                print(f"  {commodity:20s}: m={m_vals} (detected period: {detected_period})")
-            else:
-                print(f"  {commodity:20s}: m={m_vals} (using defaults)")
+        eligible_for_probe = [
+            commodity for commodity in commodity_columns
+            if len(commodity_m_map.get(commodity, [1])) > 1
+        ]
 
-        print("\n" + "="*80)
-        print("ARIMA/SARIMA GRID SEARCH CONFIGURATION")
-        print("="*80)
-        print(f"Using pmdarima auto_arima for intelligent model selection (much faster!)")
-        print(f"Non-seasonal: d=[0,1], p/q auto-selected (max_p=3, max_q=3)")
-        print(f"Seasonal: D auto-selected, P/Q auto-selected (max_P=2, max_Q=2)")
-        print(f"Seasonal period: single strongest period per commodity (from study)")
-        print(f"\nEstimated search time per commodity: 10-30 seconds (vs 5-10 minutes with grid)")
-        for commodity in sorted(commodity_columns)[:5]:  # Show first 5 as examples
-            m_vals = commodity_m_map.get(commodity, [1])
-            print(f"  {commodity:20s}: m={m_vals}")
-        print(f"  ... (see full list above)")
-        print(f"\nBENEFITS: Stepwise search + empirically-detected periods = fast & accurate")
-        print(f"          Auto-convergence handling prevents hanging")
+        probe_commodities = choose_seasonal_probe_commodities(
+            series_length_map,
+            eligible_commodities=eligible_for_probe,
+        )
+        rest_commodities = [c for c in commodity_columns if c not in probe_commodities]
+
+        try:
+            extrapolated_config_cap = max(1, int(os.getenv("SARIMAX_MAX_CONFIGS", "1")))
+        except ValueError:
+            extrapolated_config_cap = 1
+
+        if probe_commodities:
+            print(f"\nSeasonal SARIMAX probes ({len(probe_commodities)}): {', '.join(probe_commodities)}")
+            print(f"Using probe results to extrapolate up to {extrapolated_config_cap} seasonal configuration(s) to remaining commodities")
+        else:
+            print("\nNo eligible commodities selected for seasonal probing; proceeding non-seasonal for all.")
         
         # Build per-commodity tasks with optimized m_values
         tasks = []
+        probe_set = set(probe_commodities)
         for commodity in commodity_columns:
             series = prices_df[commodity].dropna()
             if series.empty:
                 print(f"  Skipping {commodity}: empty after dropna")
                 continue
-            m_values_for_commodity = commodity_m_map.get(commodity, [1])
+            if commodity in probe_set:
+                m_values_for_commodity = commodity_m_map.get(commodity, [1])
+            else:
+                m_values_for_commodity = [1]
             tasks.append((commodity, series.values, series.index.astype(str).tolist(), m_values_for_commodity))
 
         # Initialize results and models containers
@@ -684,8 +819,123 @@ if __name__ == '__main__':
                     if model_fit is not None:
                         best_models[commodity][(d_val, m_val)] = (order, seasonal_order, model_fit, aic)
 
-        # Convert to DataFrame
+        # Convert to DataFrame and derive extrapolated seasonal configurations
         arima_evaluation_df = pd.DataFrame(arima_evaluation_results)
+        seasonal_configs = derive_extrapolated_seasonal_configs(
+            arima_evaluation_df,
+            probe_commodities,
+            max_configs=extrapolated_config_cap,
+        )
+
+        extrapolated_rows = []
+        if seasonal_configs and rest_commodities:
+            print("\nExtrapolated seasonal configuration candidates:")
+            for idx, cfg in enumerate(seasonal_configs, start=1):
+                print(
+                    f"  {idx}. order={cfg['order']} seasonal_order={cfg['seasonal_order']} "
+                    f"(probe mean AIC={cfg['mean_aic']:.2f})"
+                )
+
+            try:
+                import pmdarima as pm
+            except ImportError:
+                pm = None
+                print("  Warning: pmdarima not available for extrapolated seasonal fitting.")
+
+            if pm is not None:
+                for cfg in seasonal_configs:
+                    order = tuple(cfg['order'])
+                    seasonal_order = tuple(cfg['seasonal_order'])
+                    if len(order) < 3 or len(seasonal_order) < 4:
+                        continue
+                    m_key = seasonal_order[3]
+                    if m_key <= 1:
+                        continue
+                    d_key = order[1]
+
+                    for commodity in rest_commodities:
+                        series_len = series_length_map.get(commodity, 0)
+                        if series_len <= m_key * 2:
+                            extrapolated_rows.append({
+                                'Commodity': commodity,
+                                'd': d_key,
+                                'm': m_key,
+                                'order': order,
+                                'seasonal_order': seasonal_order,
+                                'AIC': float('nan'),
+                                'Status': 'Skipped-Extrapolated',
+                                'Error Message': f'Insufficient history for m={m_key}',
+                                'Source': 'Extrapolated'
+                            })
+                            continue
+
+                        commodity_models = best_models.setdefault(commodity, {})
+                        if (d_key, m_key) in commodity_models:
+                            continue
+
+                        series = prices_df[commodity].dropna()
+                        if series.empty:
+                            extrapolated_rows.append({
+                                'Commodity': commodity,
+                                'd': d_key,
+                                'm': m_key,
+                                'order': order,
+                                'seasonal_order': seasonal_order,
+                                'AIC': float('nan'),
+                                'Status': 'Skipped-Extrapolated',
+                                'Error Message': 'Empty series',
+                                'Source': 'Extrapolated'
+                            })
+                            continue
+
+                        try:
+                            model = pm.arima.ARIMA(
+                                order=order,
+                                seasonal_order=seasonal_order,
+                                suppress_warnings=True,
+                                error_action='ignore',
+                                maxiter=200,
+                            )
+                            model.fit(series)
+                            aic_val = float(model.aic())
+                            commodity_models[(d_key, m_key)] = (order, seasonal_order, model, aic_val)
+                            extrapolated_rows.append({
+                                'Commodity': commodity,
+                                'd': d_key,
+                                'm': m_key,
+                                'order': order,
+                                'seasonal_order': seasonal_order,
+                                'AIC': aic_val,
+                                'Status': 'Success-Extrapolated',
+                                'Error Message': None,
+                                'Source': 'Extrapolated'
+                            })
+                        except Exception as exc:
+                            err_msg = str(exc)
+                            if len(err_msg) > 160:
+                                err_msg = err_msg[:157] + '...'
+                            extrapolated_rows.append({
+                                'Commodity': commodity,
+                                'd': d_key,
+                                'm': m_key,
+                                'order': order,
+                                'seasonal_order': seasonal_order,
+                                'AIC': float('nan'),
+                                'Status': 'Failed-Extrapolated',
+                                'Error Message': err_msg,
+                                'Source': 'Extrapolated'
+                            })
+
+        elif probe_commodities:
+            print("\nNo seasonal configurations from probes qualified for extrapolation.")
+
+        if extrapolated_rows:
+            extrapolated_df = pd.DataFrame(extrapolated_rows)
+            arima_evaluation_df = pd.concat([arima_evaluation_df, extrapolated_df], ignore_index=True)
+
+        if 'Source' not in arima_evaluation_df.columns:
+            arima_evaluation_df['Source'] = arima_evaluation_df.get('Source', None)
+
         print("\nARIMA Evaluation Results DataFrame Head:")
         print(arima_evaluation_df.head())
 
