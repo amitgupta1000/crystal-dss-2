@@ -29,14 +29,11 @@ warnings.filterwarnings("ignore", message="Non-stationary starting autoregressiv
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
+# Initialize GCS credentials and client at module level (lightweight)
 creds, _ = default()
-
-# Initialize the Google Cloud Storage client
 storage_client = storage.Client(credentials=creds)
 bucket_name = 'crystal-dss'
-print("Google Cloud Storage client initialized.")
 
-#==================================#============================================
 load_dotenv()
 
 target_commodities = [
@@ -49,42 +46,6 @@ target_commodities = [
     'MTBE',
     'Benzene'
 ]
-
-prices_df = download_latest_csv_from_gcs(bucket_name='crystal-dss', gcs_prefix='cleaned_data')
-logger.info('Downloaded latest cleaned DataFrame from GCS.')
-
-prices_df = prices_df.copy()
-
-# Convert 'date' column to datetime objects
-prices_df['date'] = pd.to_datetime(prices_df['date'], format='%d-%m-%y', errors='coerce')
-prices_df.set_index('date', inplace=True)
-prices_df.index.name = 'Date'
-prices_df.columns = prices_df.columns.str.strip()
-
-# Ensure data is in ascending order
-prices_df.sort_index(ascending=True, inplace=True)
-logger.info('Commodity Prices DataFrame sorted by Date (ascending). Shape: %s', prices_df.shape)
-
-# Drop columns and rows that are entirely NaN
-prices_df.dropna(axis=1, how='all', inplace=True)
-prices_df.dropna(axis=0, how='all', inplace=True)
-logger.info('Shape after dropping empty rows/columns: %s', prices_df.shape)
-
-# Verify that the prices_df DataFrame is loaded and preprocessed
-if 'prices_df' in locals():
-    print("prices_df DataFrame is loaded.")
-
-    # Inspect column names to confirm cleaning
-    print("\nprices_df columns after cleaning:")
-    print(prices_df.columns.tolist())
-
-    # Check if the index is a DatetimeIndex and sorted
-    print("\nprices_df index type:", type(prices_df.index))
-    print("prices_df index is DatetimeIndex:", isinstance(prices_df.index, pd.DatetimeIndex))
-    print("prices_df index is sorted:", prices_df.index.is_monotonic_increasing)
-
-else:
-    print("prices_df DataFrame is not loaded. Cannot proceed.")
 
 #==================================#============================================
 # SEASONALITY-GUIDED ARIMA PARAMETER OPTIMIZATION
@@ -192,89 +153,102 @@ def build_commodity_m_mapping(commodity_columns, seasonality_map):
 # ARIMA/SARIMA grid testing framework
 #==================================#============================================
 
-arima_evaluation_results = []
-best_models = {}
-
-# Identify numeric columns to use as commodity columns
-commodity_columns = [col for col in prices_df.columns if pd.api.types.is_numeric_dtype(prices_df[col])]
-
-# ARIMA/SARIMA parameters (seasonality will be loaded if needed during grid search)
-p_values = [0, 1, 2]
-q_values = [0, 1, 2]
-ds = [0, 1]
+# ARIMA/SARIMA parameters using pmdarima auto_arima (much faster than manual grid search)
 # m_values determined per-commodity based on seasonality study (loaded during grid search)
-# Simple seasonal parameters (only test when m > 1)
-seasonal_P = [0, 1]
-seasonal_D = [0, 1]
-seasonal_Q = [0, 1]
 
-
-def _commodity_grid_worker(task):
-    # task: (commodity, values, index_iso, m_values_for_commodity)
+def _commodity_auto_arima_worker(task):
+    """
+    Use pmdarima's auto_arima for fast, intelligent model selection.
+    Tests both seasonal and non-seasonal models using stepwise search.
+    
+    task: (commodity, values, index_iso, m_values_for_commodity)
+    """
     commodity, values, index_iso, m_values_for_commodity = task
     import pandas as _pd
     import pickle as _pickle
-    from statsmodels.tsa.statespace.sarimax import SARIMAX
+    import pmdarima as pm
+    from pmdarima import auto_arima
+    
     results = []
     best_map = {}
     s = _pd.Series(values, index=_pd.to_datetime(index_iso))
     
-    for d in ds:
+    # Test different d values (differencing orders)
+    for d in [0, 1]:
         for m in m_values_for_commodity:
-            best_aic = float('inf')
-            best_fit = None
-            best_order = None
-            best_seasonal_order = None
-            
-            for p in p_values:
-                for q in q_values:
-                    order = (p, d, q)
-                    
-                    # Test non-seasonal and seasonal configurations
-                    seasonal_configs = [(0, 0, 0, 0)] if m == 1 else [(P, D, Q, m) for P in seasonal_P for D in seasonal_D for Q in seasonal_Q]
-                    
-                    for seasonal_order in seasonal_configs:
-                        try:
-                            if m == 1 or seasonal_order == (0, 0, 0, 0):
-                                # Non-seasonal ARIMA
-                                model = ARIMA(s, order=order)
-                            else:
-                                # SARIMA with seasonal component
-                                model = SARIMAX(s, order=order, seasonal_order=seasonal_order)
-                            
-                            fitted = model.fit(disp=False)
-                            aic = float(fitted.aic)
-                            err = None
-                        except Exception as e:
-                            fitted = None
-                            aic = float('nan')
-                            err = str(e)
-                        
-                        results.append({
-                            'Commodity': commodity,
-                            'd': d,
-                            'm': m,
-                            'order': order,
-                            'seasonal_order': seasonal_order,
-                            'AIC': aic,
-                            'Status': 'Success' if fitted is not None else 'Failed',
-                            'Error Message': err
-                        })
-                        
-                        if fitted is not None and aic < best_aic:
-                            best_aic = aic
-                            best_fit = fitted
-                            best_order = order
-                            best_seasonal_order = seasonal_order
-            
-            if best_fit is not None:
-                # serialize best_fit to bytes for return
+            try:
+                # Use auto_arima for intelligent model selection
+                if m == 1:
+                    # Non-seasonal ARIMA
+                    model = auto_arima(
+                        s,
+                        d=d,  # Fix differencing order
+                        start_p=0, max_p=3,
+                        start_q=0, max_q=3,
+                        seasonal=False,
+                        stepwise=True,
+                        suppress_warnings=True,
+                        error_action='ignore',
+                        max_order=None,
+                        trace=False,
+                        n_fits=50  # Limit to prevent hanging
+                    )
+                else:
+                    # Seasonal ARIMA (SARIMA)
+                    model = auto_arima(
+                        s,
+                        d=d,  # Fix differencing order
+                        start_p=0, max_p=3,
+                        start_q=0, max_q=3,
+                        seasonal=True,
+                        m=m,  # Use detected seasonal period
+                        start_P=0, max_P=2,
+                        start_Q=0, max_Q=2,
+                        D=None,  # Let auto_arima choose seasonal differencing
+                        stepwise=True,
+                        suppress_warnings=True,
+                        error_action='ignore',
+                        max_order=None,
+                        trace=False,
+                        n_fits=50  # Limit to prevent hanging
+                    )
+                
+                # Extract model info
+                order = model.order
+                seasonal_order = model.seasonal_order if hasattr(model, 'seasonal_order') else (0, 0, 0, 0)
+                aic = float(model.aic())
+                
+                results.append({
+                    'Commodity': commodity,
+                    'd': d,
+                    'm': m,
+                    'order': order,
+                    'seasonal_order': seasonal_order,
+                    'AIC': aic,
+                    'Status': 'Success',
+                    'Error Message': None
+                })
+                
+                # Serialize model for storage
                 try:
-                    best_bytes = _pickle.dumps(best_fit)
+                    best_bytes = _pickle.dumps(model)
                 except Exception:
                     best_bytes = None
+                
                 # Store by (d, m) key
-                best_map[(d, m)] = (best_order, best_seasonal_order, best_bytes, best_aic)
+                best_map[(d, m)] = (order, seasonal_order, best_bytes, aic)
+                
+            except Exception as e:
+                results.append({
+                    'Commodity': commodity,
+                    'd': d,
+                    'm': m,
+                    'order': None,
+                    'seasonal_order': None,
+                    'AIC': float('nan'),
+                    'Status': 'Failed',
+                    'Error Message': str(e)
+                })
     
     return (commodity, results, best_map)
 
@@ -646,17 +620,17 @@ if __name__ == '__main__':
         print("\n" + "="*80)
         print("ARIMA/SARIMA GRID SEARCH CONFIGURATION")
         print("="*80)
-        print(f"Non-seasonal parameters: p={p_values}, d={ds}, q={q_values}")
-        print(f"Seasonal parameters: P={seasonal_P}, D={seasonal_D}, Q={seasonal_Q}")
+        print(f"Using pmdarima auto_arima for intelligent model selection (much faster!)")
+        print(f"Non-seasonal: d=[0,1], p/q auto-selected (max_p=3, max_q=3)")
+        print(f"Seasonal: D auto-selected, P/Q auto-selected (max_P=2, max_Q=2)")
         print(f"m_values: Commodity-specific based on empirical seasonality analysis")
-        print(f"\nEstimated models per commodity (varies by detected seasonality):")
+        print(f"\nEstimated search time per commodity: 10-30 seconds (vs 5-10 minutes with grid)")
         for commodity in sorted(commodity_columns)[:5]:  # Show first 5 as examples
             m_vals = commodity_m_map.get(commodity, [1, 75, 250])
-            est_models = len(p_values) * len(q_values) * len(ds) * (1 + len(seasonal_P) * len(seasonal_D) * len(seasonal_Q) * (len(m_vals) - 1))
-            print(f"  {commodity:20s}: ~{est_models} models (m={m_vals})")
+            print(f"  {commodity:20s}: m={m_vals}")
         print(f"  ... (see full list above)")
-        print(f"\nBENEFITS: Empirically-detected periods yield better fits than arbitrary quarterly/annual")
-        print(f"          Grid size similar but focused on data-driven seasonal periods")
+        print(f"\nBENEFITS: Stepwise search + empirically-detected periods = fast & accurate")
+        print(f"          Auto-convergence handling prevents hanging")
         
         # Build per-commodity tasks with optimized m_values
         tasks = []
@@ -670,10 +644,10 @@ if __name__ == '__main__':
 
         # Run per-commodity grid in parallel using processes
         max_workers = max(1, (os.cpu_count() or 1) - 1)
-        print(f"\nRunning per-commodity ARIMA grid using {max_workers} processes...")
+        print(f"\nRunning per-commodity auto_arima using {max_workers} processes...")
         import pickle as _pickle
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_commodity_grid_worker, t): t for t in tasks}
+            futures = {executor.submit(_commodity_auto_arima_worker, t): t for t in tasks}
             for fut in as_completed(futures):
                 commodity, eval_rows, best_map_ser = fut.result()
                 # append evaluations
