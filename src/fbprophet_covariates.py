@@ -125,7 +125,11 @@ def _prophet_with_covariates_single(
     conf_interval_10: bool,
 ) -> Dict[str, pd.Series]:
     """Fit Prophet with regressors for one target commodity."""
-    series = prices_df[target].dropna()
+    working_prices = prices_df.copy()
+    if working_prices.index.has_duplicates:
+        working_prices = working_prices.loc[~working_prices.index.duplicated(keep="last")]
+
+    series = working_prices[target].dropna()
     if series.empty or len(series) < 10:
         raise ValueError("insufficient observations for target forecast")
 
@@ -140,7 +144,10 @@ def _prophet_with_covariates_single(
     if not regressor_names:
         raise ValueError("no usable regressors supplied")
 
-    reg_history = prices_df[regressor_names].reindex(frame.index)
+    reg_history_source = working_prices[regressor_names]
+    if reg_history_source.index.has_duplicates:
+        reg_history_source = reg_history_source.loc[~reg_history_source.index.duplicated(keep="last")]
+    reg_history = reg_history_source.reindex(frame.index)
     reg_history = reg_history.fillna(method="ffill").fillna(method="bfill")
 
     train_df = frame.join(reg_history)
@@ -148,7 +155,12 @@ def _prophet_with_covariates_single(
     if train_df.empty:
         raise ValueError("training data empty after aligning regressors")
 
-    model = Prophet(interval_width=0.95, daily_seasonality=False)
+    model = Prophet(
+        interval_width=0.95,
+        daily_seasonality=False,
+        yearly_seasonality=True,
+        changepoint_prior_scale=0.75,
+    )
     for reg_name in regressor_names:
         model.add_regressor(reg_name)
 
@@ -205,7 +217,12 @@ def _prophet_with_covariates_single(
             bands["lower_10"] = lower_90
             bands["upper_10"] = upper_90
     elif conf_interval_10:
-        model_90 = Prophet(interval_width=0.90, daily_seasonality=False)
+        model_90 = Prophet(
+            interval_width=0.90,
+            daily_seasonality=False,
+            yearly_seasonality=True,
+            changepoint_prior_scale=0.75,
+        )
         for reg_name in regressor_names:
             model_90.add_regressor(reg_name)
         model_90.fit(train_df_reset)
@@ -229,8 +246,8 @@ def _prophet_with_covariates_single(
 
 def generate_and_save_prophet_covariate_forecast(
     prices_df: pd.DataFrame,
-    target_commodities: Iterable[str],
-    other_commodities: Iterable[str],
+    target_commodities: Optional[Iterable[str]] = None,
+    other_commodities: Optional[Iterable[str]] = None,
     *,
     forecast_steps: int = 250,
     gcs_prefix: str = "forecast_data/fb_prophet_covariates_forecast.csv",
@@ -242,19 +259,32 @@ def generate_and_save_prophet_covariate_forecast(
     if prices_df is None or prices_df.empty:
         raise ValueError("prices_df must contain historical data")
 
+    prices_df = prices_df.copy()
+    if prices_df.index.has_duplicates:
+        prices_df = prices_df[~prices_df.index.duplicated(keep="last")]
+
     bucket = bucket_name or _DEFAULT_BUCKET
 
-    valid_targets = _filter_numeric_columns(prices_df, target_commodities)
-    valid_regressors = _filter_numeric_columns(prices_df, other_commodities)
+    working_prices_df = prices_df.copy()
+    if working_prices_df.index.has_duplicates:
+        working_prices_df = working_prices_df.loc[~working_prices_df.index.duplicated(keep="last")]
+
+    numeric_columns = _filter_numeric_columns(working_prices_df, list(working_prices_df.columns))
+
+    target_list = list(target_commodities) if target_commodities is not None else numeric_columns
+    valid_targets = _filter_numeric_columns(working_prices_df, target_list)
+
+    regressor_input = list(other_commodities) if other_commodities is not None else numeric_columns
+    regressor_pool = _filter_numeric_columns(working_prices_df, regressor_input)
 
     if not valid_targets:
         raise ValueError("no valid target commodities available")
-    if not valid_regressors:
+    if not regressor_pool:
         raise ValueError("no valid exogenous regressors available")
 
     future_regressors, regressor_summary = _forecast_exogenous_series(
-        prices_df=prices_df,
-        regressors=valid_regressors,
+        prices_df=working_prices_df,
+        regressors=regressor_pool,
         forecast_steps=forecast_steps,
     )
 
@@ -271,10 +301,14 @@ def generate_and_save_prophet_covariate_forecast(
 
     for target in valid_targets:
         try:
+            target_regressors = [name for name in regressor_pool if name != target]
+            if not target_regressors:
+                run_summaries.append({"Commodity": target, "Status": "Failed", "Reason": "No regressors available"})
+                continue
             bands = _prophet_with_covariates_single(
-                prices_df=prices_df,
+                prices_df=working_prices_df,
                 target=target,
-                regressors=valid_regressors,
+                regressors=target_regressors,
                 future_regressors=future_regressors,
                 forecast_steps=forecast_steps,
                 conf_interval_05=conf_interval_05,
@@ -295,7 +329,7 @@ def generate_and_save_prophet_covariate_forecast(
         print("\nProphet target forecasting summary:")
         print(pd.DataFrame(run_summaries).to_string(index=False))
 
-    historical_df = prices_df[valid_targets].copy()
+    historical_df = working_prices_df[valid_targets].copy()
     combined_frames: Dict[str, pd.Series] = {}
     combined_frames.update(forecasts)
     combined_frames.update(lower_05)
@@ -308,7 +342,6 @@ def generate_and_save_prophet_covariate_forecast(
         if getattr(future_index, "tz", None) is not None:
             future_index = future_index.tz_localize(None)
         forecast_wide.index = future_index
-    forecast_wide = pd.DataFrame(combined_frames) if combined_frames else pd.DataFrame(columns=historical_df.columns)
     combined_df = pd.concat([historical_df, forecast_wide], axis=0, join="outer")
     combined_df.sort_index(inplace=True)
     combined_df.index.name = "Date"
@@ -316,7 +349,7 @@ def generate_and_save_prophet_covariate_forecast(
     if not forecast_wide.empty:
         horizon_msg = (
             f"Prophet covariate forecast horizon: "
-            f"{forecast_wide.index.min().date()} → {forecast_wide.index.max().date()}"
+            f"{forecast_wide.index.min().date()} -> {forecast_wide.index.max().date()}"
             f" ({forecast_wide.shape[0]} steps)"
         )
         print(f"\n{horizon_msg}")

@@ -30,7 +30,7 @@ def build_dataframe(uploaded_file=None):
 
     # #=========1.create the globals dataframe#=================
     ### List of Global Macro Commodities
-    symbols = ['^GSPC', '000001.SS', 'DX=F', 'JPY=X', 'CL=F', 'NG=F', 'GC=F', 'SI=F', 'HG=F', 'ZN=F', ]
+    symbols = ['^GSPC', '000001.SS', 'DX=F', 'JPY=X', 'INR=X', '^NSEI', 'CL=F', 'NG=F', 'GC=F', 'SI=F', 'HG=F', 'ZN=F', ]
 
     # Create a dictionary to map original commodity labels to desired ones
     commodity_mapping = {

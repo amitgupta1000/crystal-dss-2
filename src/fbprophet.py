@@ -63,7 +63,12 @@ def _prophet_forecast_single(
     freq = _infer_frequency(frame["ds"])
     last_date = frame["ds"].max()
 
-    model = Prophet(interval_width=0.95, daily_seasonality=False)
+    model = Prophet(
+        interval_width=0.95,
+        daily_seasonality=False,
+        yearly_seasonality=True,
+        changepoint_prior_scale=0.75,
+    )
     model.fit(frame)
 
     future = model.make_future_dataframe(periods=forecast_steps, freq=freq)
@@ -98,7 +103,12 @@ def _prophet_forecast_single(
             bands["lower_10"] = lower_90
             bands["upper_10"] = upper_90
     elif conf_interval_10:
-        model_90 = Prophet(interval_width=0.90, daily_seasonality=False)
+        model_90 = Prophet(
+            interval_width=0.90,
+            daily_seasonality=False,
+            yearly_seasonality=True,
+            changepoint_prior_scale=0.75,
+        )
         model_90.fit(frame)
         forecast_90 = model_90.predict(future)
         future_forecast_90 = forecast_90[forecast_90["ds"] > last_date]

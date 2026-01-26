@@ -30,23 +30,6 @@ bucket_name = 'crystal-dss'
 
 load_dotenv()
 
-# Define the target commodities
-target_commodities = [
-    'Acetic Acid', 'Butyl Acetate', 'Toluene', 'Isomer-MX', 'Solvent-MX', 'Methanol',
-    'MTBE', 'Benzene'
-]
-
-# Define the other commodities to correlate against
-other_commodities = [
-    'Gold', 'Silver', 'Copper', 'S&P 500', 'Shanghai Composite', 'USD Index',
-    'Japanese Yen', 'US 10-Y BOND PRICE', 'Crude Oil', 'Natural Gas', 'Naphtha',
-    'EDC', 'Ethylene', 'Propylene', 'N-Butanol', 'Paraxylene', 'OrthXylene',
-    'Cyclohexane', 'Styrene', 'DEG', '2 EH', 'Acetic Acid', 'Butyl Acetate',
-    'Toluene', 'Isomer-MX', 'Solvent-MX', 'Methanol', 'MTBE', 'Benzene'
-]
-
-
-
 def run_dummy_forecast(model_name, bucket_name):
     print("\n" + "=" * 80)
     print(f"{model_name.upper()} FORECAST PLACEHOLDER")
@@ -232,8 +215,7 @@ if __name__ == '__main__':
         try:
             prophet_cov_df, prophet_cov_gcs_prefix = generate_and_save_prophet_covariate_forecast(
                 prices_df=prices_df,
-                target_commodities=target_commodities,
-                other_commodities=other_commodities,
+                other_commodities=commodity_columns,
                 forecast_steps=forecast_steps,
                 gcs_prefix='forecast_data/fb_prophet_covariates_forecast.csv',
                 conf_interval_05=True,
