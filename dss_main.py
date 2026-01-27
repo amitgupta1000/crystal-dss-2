@@ -125,7 +125,7 @@ if __name__ == '__main__':
     print("Generating Forecasts with Confidence Intervals")
     print("=" * 80)
     forecast_steps = int(
-        input("\nEnter number of forecast periods (default 250): ").strip() or "250"
+        input("\nEnter number of forecast periods (default 128): ").strip() or "128"
     )
     print(
         f"\nGenerating {forecast_steps}-step forecast with 5% and 10% confidence intervals..."

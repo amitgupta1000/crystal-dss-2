@@ -44,7 +44,7 @@ def build_dataframe(uploaded_file=None):
     for commodity in symbols:
         try:
             ticker = yf.Ticker(commodity)
-            data = ticker.history(period='6y', interval='1wk')
+            data = ticker.history(period='6y', interval='1d')
             data = data.reset_index()
             data['date'] = data['Date'].dt.strftime('%Y-%m-%d')
             close_data = data[['date', 'Close']].rename(columns=lambda x: f"{commodity_mapping.get(commodity, commodity)}" if x == 'Close' else x)

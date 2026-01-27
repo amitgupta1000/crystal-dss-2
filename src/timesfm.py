@@ -26,7 +26,32 @@ def _infer_frequency(index: pd.Index) -> str:
         freq = pd.infer_freq(index)
     except Exception:  # pragma: no cover - pandas-specific edge cases
         freq = None
-    return freq or "D"
+    if not freq:
+        return "D"
+
+    # Normalize pandas frequency strings to a single-letter code expected
+    # by downstream code / TimesFM examples (e.g. 'W-SUN' -> 'W').
+    # Map common pandas freq codes to simplified letters.
+    code = freq.upper()
+    if code.startswith("W"):
+        return "W"
+    if code.startswith("M"):
+        return "M"
+    if code.startswith("Q"):
+        return "Q"
+    if code.startswith("A") or code.startswith("Y"):
+        return "Y"
+    if code.startswith("D") or code.startswith("B"):
+        return "D"
+    if code.startswith("H"):
+        return "H"
+    if code.startswith("T") or code.startswith("MIN"):
+        return "T"
+    if code.startswith("S"):
+        return "S"
+
+    # Default to daily if unknown
+    return "D"
 
 
 def _prepare_long_frame(prices_df: pd.DataFrame, commodities: Sequence[str]) -> pd.DataFrame:
@@ -80,9 +105,55 @@ def _pivot_forecast_values(forecast_df: pd.DataFrame, column: str) -> pd.DataFra
 
 def _build_timesfm_model(forecast_steps: int) -> TimesFm:
     """Instantiate a TimesFM model for the requested horizon."""
-    hparams = TimesFmHparams(backend="cpu", horizon_len=forecast_steps)
+    backend = os.getenv("TIMESFM_BACKEND", "cpu")
+
+    # Use explicit hparams when the well-known 500m checkpoint is requested.
+    # The README for that checkpoint requires these five parameters to match
+    # the pretrained architecture.
+    hparams_kwargs = {"backend": backend, "horizon_len": forecast_steps}
+    if "500m" in _TIMESFM_REPO or _TIMESFM_REPO.endswith("timesfm-2.0-500m-pytorch"):
+        hparams_kwargs.update(
+            {
+                "input_patch_len": 32,
+                "output_patch_len": 128,
+                "num_layers": 50,
+                "model_dims": 1280,
+                "use_positional_embedding": False,
+            }
+        )
+
+    hparams = TimesFmHparams(**hparams_kwargs)
     checkpoint = TimesFmCheckpoint(huggingface_repo_id=_TIMESFM_REPO)
-    return TimesFm(hparams=hparams, checkpoint=checkpoint)
+    try:
+        return TimesFm(hparams=hparams, checkpoint=checkpoint)
+    except Exception as exc:  # pragma: no cover - runtime mismatch between weights and code
+        # Attempt to surface a helpful error message when checkpoint and installed
+        # `timesfm` package versions/architectures mismatch (common cause of
+        # unexpected state_dict keys when loading pretrained weights).
+        import importlib
+
+        try:
+            timesfm_mod = importlib.import_module("timesfm")
+            timesfm_version = getattr(timesfm_mod, "__version__", "unknown")
+        except Exception:
+            timesfm_version = "(unable to determine installed timesfm version)"
+
+        hint_lines = [
+            f"Failed to instantiate TimesFm using checkpoint: {_TIMESFM_REPO}",
+            f"Installed timesfm package version: {timesfm_version}",
+            "This usually means the checkpoint architecture doesn't match the installed",
+            "timesfm package. Possible remedies:",
+            "  1) Set the environment variable TIMESFM_REPO_ID to a repo compatible",
+            "     with your installed `timesfm` package (for example an older checkpoint).",
+            "  2) Update/downgrade the `timesfm` package so its model code matches",
+            "     the checkpoint downloaded (edit requirements.txt and reinstall).",
+            "  3) Avoid using the pretrained checkpoint by constructing TimesFm without",
+            "     the checkpoint (not recommended if you need pretrained weights).",
+            "If you'd like, I can try to modify the code to fall back more gracefully.",
+        ]
+
+        detailed = "\n".join(hint_lines)
+        raise RuntimeError(f"TimesFm model instantiation failed: {exc}\n\n{detailed}") from exc
 
 
 def generate_and_save_timesfm_forecast(
@@ -116,18 +187,42 @@ def generate_and_save_timesfm_forecast(
 
     model = _build_timesfm_model(forecast_steps)
     quantiles = sorted({0.05, 0.10, 0.90, 0.95})
-    forecast_df = model.forecast_on_df(
-        inputs=long_frame,
-        freq=freq,
-        value_name="y",
-        quantiles=quantiles,
-        num_jobs=num_jobs,
-    )
+    # Some installed `timesfm` versions may not accept the `quantiles` kwarg
+    # on `forecast_on_df`. Attempt with quantiles and fall back to calling
+    # without if the installed package raises a TypeError about the argument.
+    try:
+        forecast_df = model.forecast_on_df(
+            inputs=long_frame,
+            freq=freq,
+            value_name="y",
+            quantiles=quantiles,
+            num_jobs=num_jobs,
+        )
+        quantiles_supported = True
+    except TypeError as exc:  # pragma: no cover - depends on installed timesfm
+        msg = str(exc)
+        if "quantiles" in msg or "unexpected" in msg:
+            print("TimesFM: installed `timesfm` does not support `quantiles` on forecast_on_df; retrying without quantiles.")
+            try:
+                forecast_df = model.forecast_on_df(
+                    inputs=long_frame,
+                    freq=freq,
+                    value_name="y",
+                    num_jobs=num_jobs,
+                )
+                quantiles_supported = False
+            except Exception:
+                raise
+        else:
+            raise
 
     forecast_df = forecast_df.copy()
     forecast_df["ds"] = pd.to_datetime(forecast_df["ds"], utc=False).dt.tz_localize(None)
 
     quantile_map = _quantile_column_map(forecast_df.columns)
+    if not quantile_map:
+        if quantiles and not quantiles_supported:
+            print("TimesFM: quantile columns not present in forecast output; returning point forecasts only.")
     lower_05_col = _select_quantile_column(quantile_map, 0.05)
     upper_05_col = _select_quantile_column(quantile_map, 0.95)
     lower_10_col = _select_quantile_column(quantile_map, 0.10)
