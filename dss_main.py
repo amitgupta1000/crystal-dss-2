@@ -7,9 +7,15 @@ import numpy as np
 import warnings
 from google.cloud import storage
 from google.auth import default
+
+# Set Hugging Face cache directory before importing TimesFM
+os.environ.setdefault("HF_HOME", r"C:\hf_cache")
+os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
+os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 from src import arima
 from src.fbprophet import generate_and_save_prophet_forecast
 from src.fbprophet_covariates import generate_and_save_prophet_covariate_forecast
+from src.timesfm import generate_and_save_timesfm_forecast
 from src.file_utils import save_dataframe_to_gcs, download_latest_csv_from_gcs
 import logging
 
@@ -98,21 +104,22 @@ if __name__ == '__main__':
     print("  1. ARIMA")
     print("  2. FB Prophet")
     print("  3. FB Prophet with Covariates")
-    print("  4. All of the above (sequential)")
-    selection_input = input("\nEnter selection (e.g., 1 or 1,2 or 4 for all): ").strip()
+    print("  4. TimesFM")
+    print("  5. All of the above (sequential)")
+    selection_input = input("\nEnter selection (e.g., 1 or 1,3 or 5 for all): ").strip()
 
     tokens = [token.strip() for token in selection_input.split(',') if token.strip()]
     selected_options = []
     for token in tokens:
-        if token == '4':
-            selected_options = ['1', '2', '3']
+        if token == '5':
+            selected_options = ['1', '2', '3', '4']
             break
-        if token in {'1', '2', '3'} and token not in selected_options:
+        if token in {'1', '2', '3', '4'} and token not in selected_options:
             selected_options.append(token)
     if not selected_options:
-        selected_options = ['1', '2', '3']
+        selected_options = ['1', '2', '3', '4']
 
-    run_all_selected = set(selected_options) == {'1', '2', '3'}
+    run_all_selected = set(selected_options) == {'1', '2', '3', '4'}
 
     print("\n" + "=" * 80)
     print("Generating Forecasts with Confidence Intervals")
@@ -240,9 +247,37 @@ if __name__ == '__main__':
                 }
             )
 
+    if '4' in selected_options:
+        try:
+            timesfm_combined_df, timesfm_gcs_prefix = generate_and_save_timesfm_forecast(
+                prices_df=prices_df,
+                commodity_columns=commodity_columns,
+                forecast_steps=forecast_steps,
+                gcs_prefix='forecast_data/timesfm_forecast.csv',
+                conf_interval_05=True,
+                conf_interval_10=True,
+                bucket_name=bucket_name,
+            )
+            model_results.append(
+                {
+                    'model': 'TimesFM',
+                    'gcs_prefix': timesfm_gcs_prefix,
+                    'rows': timesfm_combined_df.shape[0],
+                    'columns': timesfm_combined_df.shape[1],
+                    'status': 'Completed',
+                }
+            )
+        except Exception as exc:
+            model_results.append(
+                {
+                    'model': 'TimesFM',
+                    'gcs_prefix': 'n/a',
+                    'status': f'Failed: {exc}',
+                }
+            )
+
     if run_all_selected:
         additional_models = [
-            'Google TimesFM',
             'KAN',
             'MAMBA',
             'GRU',
