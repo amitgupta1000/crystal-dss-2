@@ -29,6 +29,15 @@ creds, _ = default()
 storage_client = storage.Client(credentials=creds)
 BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "crystal-dss")
 
+# Hidden layer configuration for KAN: comma-separated env var, default 32,16
+_raw = os.getenv("KAN_HIDDEN_UNITS", "32,16")
+try:
+    KAN_HIDDEN_UNITS = tuple(int(x) for x in _raw.split(',') if x.strip())
+    if not KAN_HIDDEN_UNITS:
+        KAN_HIDDEN_UNITS = (32, 16)
+except Exception:
+    KAN_HIDDEN_UNITS = (32, 16)
+
 # Check for pykan availability
 try:
     from kan import KAN
@@ -92,33 +101,177 @@ def prepare_sequences(
     return X_tensor, y_tensor, scaler
 
 
+def diagnose_kan_fit(
+    series: pd.Series,
+    sequence_length: int = 30,
+    num_epochs: int = 100,
+    batch_size: int = 64,
+    learning_rate: float = 0.00001,
+    hidden_units: Tuple[int, ...] = KAN_HIDDEN_UNITS,
+    device: Optional[torch.device] = None,
+):
+    """Run diagnostics for KAN fit on a single series.
+
+    Prints training-set fit diagnostics and the model prediction for the
+    last input sequence so you can see why the first forecast step may
+    be disconnected from the history.
+    """
+    if not KAN_AVAILABLE:
+        print("KAN not available in this environment. Install pykan to run diagnostics.")
+        return None
+
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    series = series.dropna()
+    if len(series) < sequence_length + 1:
+        print(f"Insufficient data ({len(series)}) for sequence length {sequence_length}")
+        return None
+
+    print(f"Running KAN diagnostics: seq_len={sequence_length}, epochs={num_epochs}, hidden={hidden_units}")
+
+    X_tensor, y_tensor, scaler = prepare_sequences(series, sequence_length)
+
+    # Train model (this will raise if KAN not available)
+    model = train_kan_model(
+        X_tensor,
+        y_tensor,
+        sequence_length=sequence_length,
+        num_epochs=num_epochs,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        hidden_units=hidden_units,
+    )
+
+    model.to(device)
+    model.eval()
+
+    # Predict on the entire training set (scaled space)
+    with torch.no_grad():
+        inputs = X_tensor.to(device)
+        try:
+            outputs = model(inputs)
+            if isinstance(outputs, tuple):
+                preds = outputs[0].cpu().numpy().reshape(-1)
+            else:
+                preds = outputs.cpu().numpy().reshape(-1)
+        except Exception as exc:
+            print(f"  ✗ Failed to run model on training inputs: {exc}")
+            return None
+
+    # Compare scaled predictions vs targets
+    y_scaled = y_tensor.cpu().numpy().reshape(-1)
+    pred_scaled = preds
+
+    # Metrics in scaled space
+    mae_scaled = float(np.mean(np.abs(pred_scaled - y_scaled)))
+    rmse_scaled = float(np.sqrt(np.mean((pred_scaled - y_scaled) ** 2)))
+
+    # Inverse transform to original space for interpretability
+    try:
+        y_orig = scaler.inverse_transform(y_scaled.reshape(-1, 1)).reshape(-1)
+        pred_clipped = np.clip(pred_scaled, 0.0, 1.0)
+        pred_orig = scaler.inverse_transform(pred_clipped.reshape(-1, 1)).reshape(-1)
+    except Exception:
+        y_orig = None
+        pred_orig = None
+
+    print("\nTraining-set diagnostics:")
+    print(f"  Samples: {len(y_scaled)}")
+    print(f"  Target scaled: mean={y_scaled.mean():.4f}, min={y_scaled.min():.4f}, max={y_scaled.max():.4f}")
+    print(f"  Pred scaled: mean={pred_scaled.mean():.4f}, min={pred_scaled.min():.4f}, max={pred_scaled.max():.4f}")
+    print(f"  MAE (scaled): {mae_scaled:.6f}, RMSE (scaled): {rmse_scaled:.6f}")
+
+    # Show last 5 target vs prediction (scaled and original)
+    n = min(5, len(y_scaled))
+    print("\nLast training targets vs preds (scaled):")
+    for i in range(-n, 0):
+        print(f"  target={y_scaled[i]:.6f}  pred={pred_scaled[i]:.6f}")
+
+    if y_orig is not None:
+        print("\nLast training targets vs preds (original scale):")
+        for i in range(-n, 0):
+            print(f"  target={y_orig[i]:.6f}  pred={pred_orig[i]:.6f}")
+
+    # Inspect the last input sequence (the one used to generate the first forecast)
+    last_sequence = series.values[-sequence_length:]
+    last_scaled = scaler.transform(last_sequence.reshape(-1, 1)).flatten()
+    last_seq_tensor = torch.tensor(last_scaled, dtype=torch.float32).unsqueeze(0).to(device)
+
+    with torch.no_grad():
+        out = model(last_seq_tensor)
+        if isinstance(out, tuple):
+            next_scaled = float(out[0].cpu().numpy().reshape(-1)[0])
+        else:
+            next_scaled = float(out.cpu().numpy().reshape(-1)[0])
+
+    print("\nLast input sequence (scaled) summary:")
+    print(f"  last_scaled: mean={last_scaled.mean():.4f}, min={last_scaled.min():.4f}, max={last_scaled.max():.4f}")
+    print(f"  predicted next (scaled, raw) = {next_scaled:.6f}")
+    print(f"  predicted next (scaled, clipped) = {np.clip(next_scaled,0,1):.6f}")
+    try:
+        pred_next_orig = scaler.inverse_transform([[np.clip(next_scaled, 0.0, 1.0)]])[0][0]
+        print(f"  predicted next (original, clipped) = {pred_next_orig:.6f}")
+        print(f"  last observed (original) = {last_sequence[-1]:.6f}")
+    except Exception:
+        pass
+
+    return {
+        'model': model,
+        'scaler': scaler,
+        'mae_scaled': mae_scaled,
+        'rmse_scaled': rmse_scaled,
+        'last_pred_scaled': next_scaled,
+    }
+
+
 def train_kan_model(
     X_tensor: torch.Tensor,
     y_tensor: torch.Tensor,
     sequence_length: int = 30,
     num_epochs: int = 30,
     batch_size: int = 64,
-    learning_rate: float = 0.0001,
+    learning_rate: float = 0.001,
     patience: int = 5,
+    hidden_units: Tuple[int, ...] = KAN_HIDDEN_UNITS,
+    use_manual: bool = True,
 ) -> 'KAN':
-    """Train a KAN model on the provided data using pykan's official API."""
-    
+    """Train a KAN model on the provided data.
+
+    Default is to use a controlled manual PyTorch training loop via
+    `_train_kan_manual` to avoid hidden package regularizers. Set
+    `use_manual=False` to call the library `.fit()` API instead.
+    """
     if not KAN_AVAILABLE:
         raise RuntimeError("KAN library not available. Install with: pip install pykan")
-    
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"  Training on device: {device}")
-    
-    # Prepare dataset in pykan format
-    # pykan expects dict with 'train_input' and 'train_label' keys
-    # Ensure tensors are 2D: (samples, features)
+
+    # Ensure targets shape
     if y_tensor.ndim == 1:
         y_tensor = y_tensor.unsqueeze(1)
 
-    # Ensure dataset includes optional keys that some pykan versions expect
-    # (for example: 'test_input', 'test_label', 'val_input', 'val_label').
-    # Providing empty tensors for these keys avoids KeyError inside `.fit()`
-    # while keeping the training behavior unchanged.
+    # Initialize model
+    width = [sequence_length] + list(hidden_units) + [1]
+    model = KAN(width=width, grid=5, k=3, seed=42, device=device)
+
+    if use_manual:
+        print(f"    Using manual training (num_epochs={num_epochs}, lr={learning_rate})")
+        model = _train_kan_manual(
+            model,
+            X_tensor,
+            y_tensor,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            patience=patience,
+            device=device,
+            clip_norm=1.0,
+        )
+        return model
+
+    # Otherwise, attempt to use pykan's .fit()
     empty_input = torch.empty((0, X_tensor.shape[1]), dtype=torch.float32, device=device)
     empty_label = torch.empty((0, y_tensor.shape[1]), dtype=torch.float32, device=device)
 
@@ -130,32 +283,26 @@ def train_kan_model(
         'val_input': empty_input,
         'val_label': empty_label,
     }
-    
-    # Initialize KAN model with pykan API
-    # Architecture: input_dim -> 16 nodes -> 8 nodes -> 1 output
-    # grid: number of intervals for spline functions
-    # k: order of piecewise polynomial (3 = cubic splines)
-    model = KAN(width=[sequence_length, 16, 8, 1], grid=5, k=3, seed=42, device=device)
-    
-    # Train using pykan's official .fit() method
-    # This handles the training loop, optimizer, and loss internally
+
     try:
-        print(f"    Training KAN for {num_epochs} steps...")
+        print(f"    Training KAN (pykan .fit) for {num_epochs} steps...")
         model.fit(
             dataset,
-            opt="Adam",  # Adam optimizer
+            opt="Adam",
             steps=num_epochs,
             lr=learning_rate,
-            lamb=0.0,  # No L1 regularization for time series
-            lamb_entropy=0.0,  # No entropy regularization
-            )
+            lamb=0.0,
+            lamb_entropy=0.0,
+        )
         print(f"    Training complete")
     except Exception as e:
         print(f"    Warning: pykan .fit() failed ({e}), falling back to manual training")
-        # Fallback to manual training if .fit() has issues
         model = _train_kan_manual(model, X_tensor, y_tensor, num_epochs, batch_size, learning_rate, patience, device)
-    
+
     return model
+
+
+
 
 
 def _train_kan_manual(
@@ -167,6 +314,7 @@ def _train_kan_manual(
     learning_rate: float,
     patience: int,
     device: torch.device,
+    clip_norm: float = 1.0,
 ) -> 'KAN':
     """Fallback manual training if pykan .fit() fails."""
     # Create dataset and dataloader
@@ -190,41 +338,66 @@ def _train_kan_manual(
     patience_counter = 0
     best_model_state = None
     
+    # Move model to device and set train mode
+    try:
+        model.to(device)
+    except Exception:
+        pass
+    try:
+        model.train()
+    except Exception:
+        pass
+
     # Training loop
     for epoch in range(num_epochs):
         running_loss = 0.0
         for inputs, targets in train_loader:
             inputs, targets = inputs.to(device), targets.to(device)
-            
+
             # Ensure targets have correct shape
             if targets.ndim == 1:
                 targets = targets.unsqueeze(1)
-            
+
             optimizer.zero_grad()
             outputs = model(inputs)
-            
+
+            # outputs may be tuple from pykan layers
+            if isinstance(outputs, tuple):
+                outputs = outputs[0]
+
             loss = criterion(outputs, targets)
             loss.backward()
+
+            # Gradient clipping
+            try:
+                torch.nn.utils.clip_grad_norm_(optimizer.param_groups[0]['params'], clip_norm)
+            except Exception:
+                try:
+                    params = [p for p in model.parameters() if p.grad is not None]
+                    torch.nn.utils.clip_grad_norm_(params, clip_norm)
+                except Exception:
+                    pass
+
             optimizer.step()
-            
+
             running_loss += loss.item()
-        
-        avg_loss = running_loss / len(train_loader)
-        
+
+        avg_loss = running_loss / max(1, len(train_loader))
+
         # Early stopping check
         if avg_loss < best_loss:
             best_loss = avg_loss
             patience_counter = 0
             try:
                 best_model_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-            except:
+            except Exception:
                 best_model_state = None
         else:
             patience_counter += 1
-        
-        if (epoch + 1) % 5 == 0:
-            print(f"    Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.4f}")
-        
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            print(f"    Epoch [{epoch+1}/{num_epochs}], Loss: {avg_loss:.6f}, Best: {best_loss:.6f}")
+
         # Early stopping triggered
         if patience_counter >= patience:
             print(f"    Early stopping at epoch {epoch+1} (no improvement for {patience} epochs)")
@@ -247,19 +420,29 @@ def forecast_with_kan(
     scaler: MinMaxScaler,
     forecast_steps: int,
     device: torch.device,
+    *,
+    blend_steps: int = 3,
 ) -> np.ndarray:
-    """Generate multi-step forecast using trained KAN model."""
-    
+    """Generate multi-step forecast using trained KAN model.
+
+    If `blend_steps` > 0, the first `blend_steps` forecasted values are
+    linearly blended with the last observed value to avoid a sharp
+    discontinuity at the forecast boundary. This is a pragmatic fallback
+    while the model is being tuned.
+    """
+
     model.eval()
-    
+
     # Scale the initial sequence
     scaled_sequence = scaler.transform(last_sequence.reshape(-1, 1)).flatten()
     sequence_tensor = torch.tensor(scaled_sequence, dtype=torch.float32).unsqueeze(0).to(device)
-    
+
     forecast_values = []
-    
+
+    last_observed = float(last_sequence[-1])
+
     with torch.no_grad():
-        for _ in range(forecast_steps):
+        for step in range(forecast_steps):
             # Predict next value
             output = model(sequence_tensor)
             # Handle potential tuple return (some KAN versions return (output, preacts, postacts, postspline))
@@ -267,15 +450,31 @@ def forecast_with_kan(
                 predicted_scaled = output[0].item()
             else:
                 predicted_scaled = output.item()
-            
-            # Inverse scale
-            predicted_original = scaler.inverse_transform([[predicted_scaled]])[0][0]
-            forecast_values.append(predicted_original)
-            
-            # Update sequence (shift window)
-            new_val = torch.tensor([[predicted_scaled]], dtype=torch.float32).to(device)
+
+            try:
+                predicted_scaled = float(predicted_scaled)
+            except Exception:
+                predicted_scaled = float(np.asarray(predicted_scaled).item())
+
+            # Clip predicted scaled value to valid [0, 1] range to avoid large extrapolation
+            clipped = float(np.clip(predicted_scaled, 0.0, 1.0))
+
+            # Inverse scale using clipped value
+            predicted_original = scaler.inverse_transform([[clipped]])[0][0]
+
+            # Apply blending/anchoring for the first few steps
+            if blend_steps and step < blend_steps:
+                # alpha ramps from 0 (use last observed) to 1 (use model)
+                alpha = (step + 1) / float(blend_steps)
+                blended = alpha * predicted_original + (1.0 - alpha) * last_observed
+                forecast_values.append(blended)
+            else:
+                forecast_values.append(predicted_original)
+
+            # Update sequence (shift window) using clipped scaled value
+            new_val = torch.tensor([[clipped]], dtype=torch.float32).to(device)
             sequence_tensor = torch.cat((sequence_tensor[:, 1:], new_val), dim=1)
-    
+
     return np.array(forecast_values)
 
 
@@ -286,12 +485,14 @@ def save_kan_model_to_gcs(
     sequence_length: int = 30,
     prefix: str = 'models/kan/',
     bucket_name: str = BUCKET_NAME,
+    hidden_units: Tuple[int, ...] = KAN_HIDDEN_UNITS,
 ) -> Optional[str]:
     """Save trained KAN model to GCS."""
     try:
         # Create filename
         clean_name = re.sub(r"\s+", '_', commodity)
-        key = f"{prefix}{clean_name}_seq{sequence_length}.pth"
+        hidden_part = "-".join(str(x) for x in hidden_units) if hidden_units else "none"
+        key = f"{prefix}{clean_name}_seq{sequence_length}_h{hidden_part}.pth"
         
         # Save model state dict to bytes
         buffer = io.BytesIO()
@@ -325,7 +526,9 @@ def load_kan_model_from_gcs(
     
     try:
         clean_name = re.sub(r"\s+", '_', commodity)
-        key = f"{prefix}{clean_name}_seq{sequence_length}.pth"
+        # Construct key using configured hidden unit sizes to match saved model filename
+        hidden_part = "-".join(str(x) for x in KAN_HIDDEN_UNITS) if KAN_HIDDEN_UNITS else "none"
+        key = f"{prefix}{clean_name}_seq{sequence_length}_h{hidden_part}.pth"
         
         bucket = storage_client.bucket(bucket_name)
         blob = bucket.blob(key)
@@ -341,7 +544,9 @@ def load_kan_model_from_gcs(
         
         # Load into model with matching initialization parameters
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        model = KAN(width=[sequence_length, 16, 8, 1], grid=5, k=3, seed=42, device=device)
+        # Build model using configured hidden units
+        width = [sequence_length] + list(KAN_HIDDEN_UNITS) + [1]
+        model = KAN(width=width, grid=5, k=3, seed=42, device=device)
         model.load_state_dict(torch.load(buffer, map_location=device))
         model.eval()
         
@@ -464,6 +669,7 @@ def generate_and_save_kan_forecast(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     print(f"Sequence length: {sequence_length}")
+    print(f"KAN hidden units: {KAN_HIDDEN_UNITS}")
     print(f"Forecast steps: {forecast_steps}")
     
     # Determine if we need to train models

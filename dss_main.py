@@ -59,6 +59,12 @@ bucket_name = 'crystal-dss'
 
 load_dotenv()
 
+# Number of KAN training epochs can be controlled via environment variable KAN_EPOCHS
+try:
+    kan_num_epochs = int(os.getenv("KAN_EPOCHS", "20"))
+except Exception:
+    kan_num_epochs = 20
+
 def run_dummy_forecast(model_name, bucket_name):
     print("\n" + "=" * 80)
     print(f"{model_name.upper()} FORECAST PLACEHOLDER")
@@ -314,6 +320,7 @@ if __name__ == '__main__':
                 forecast_steps=forecast_steps,
                 gcs_prefix='forecast_data/kan_forecast.csv',
                 train_new_models=False,  # Auto: load if exists, train if not
+                num_epochs=100,
                 conf_interval_05=True,
                 conf_interval_10=True,
                 bucket_name=bucket_name,
