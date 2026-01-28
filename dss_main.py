@@ -16,6 +16,7 @@ from src import arima
 from src.fbprophet import generate_and_save_prophet_forecast
 from src.fbprophet_covariates import generate_and_save_prophet_covariate_forecast
 from src.timesfm import generate_and_save_timesfm_forecast
+from src.gru import generate_and_save_gru_forecast
 from src.file_utils import save_dataframe_to_gcs, download_latest_csv_from_gcs
 import logging
 
@@ -105,21 +106,22 @@ if __name__ == '__main__':
     print("  2. FB Prophet")
     print("  3. FB Prophet with Covariates")
     print("  4. TimesFM")
-    print("  5. All of the above (sequential)")
-    selection_input = input("\nEnter selection (e.g., 1 or 1,3 or 5 for all): ").strip()
+    print("  5. GRU")
+    print("  6. All of the above (sequential)")
+    selection_input = input("\nEnter selection (e.g., 1 or 1,3 or 6 for all): ").strip()
 
     tokens = [token.strip() for token in selection_input.split(',') if token.strip()]
     selected_options = []
     for token in tokens:
-        if token == '5':
-            selected_options = ['1', '2', '3', '4']
+        if token == '6':
+            selected_options = ['1', '2', '3', '4', '5']
             break
-        if token in {'1', '2', '3', '4'} and token not in selected_options:
+        if token in {'1', '2', '3', '4', '5'} and token not in selected_options:
             selected_options.append(token)
     if not selected_options:
-        selected_options = ['1', '2', '3', '4']
+        selected_options = ['1', '2', '3', '4', '5']
 
-    run_all_selected = set(selected_options) == {'1', '2', '3', '4'}
+    run_all_selected = set(selected_options) == {'1', '2', '3', '4', '5'}
 
     print("\n" + "=" * 80)
     print("Generating Forecasts with Confidence Intervals")
@@ -276,11 +278,40 @@ if __name__ == '__main__':
                 }
             )
 
+    if '5' in selected_options:
+        try:
+            gru_combined_df, gru_gcs_prefix = generate_and_save_gru_forecast(
+                prices_df=prices_df,
+                commodity_columns=commodity_columns,
+                forecast_steps=forecast_steps,
+                gcs_prefix='forecast_data/gru_forecast.csv',
+                train_new_models=False,  # Auto: load if exists, train if not
+                conf_interval_05=True,
+                conf_interval_10=True,
+                bucket_name=bucket_name,
+            )
+            model_results.append(
+                {
+                    'model': 'GRU',
+                    'gcs_prefix': gru_gcs_prefix,
+                    'rows': gru_combined_df.shape[0],
+                    'columns': gru_combined_df.shape[1],
+                    'status': 'Completed',
+                }
+            )
+        except Exception as exc:
+            model_results.append(
+                {
+                    'model': 'GRU',
+                    'gcs_prefix': 'n/a',
+                    'status': f'Failed: {exc}',
+                }
+            )
+
     if run_all_selected:
         additional_models = [
             'KAN',
             'MAMBA',
-            'GRU',
         ]
         for model_name in additional_models:
             model_results.append(run_dummy_forecast(model_name, bucket_name))
