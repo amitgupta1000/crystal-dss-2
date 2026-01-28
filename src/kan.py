@@ -369,59 +369,18 @@ def _train_single_commodity(args):
         # Prepare sequences
         X_tensor, y_tensor, scaler = prepare_sequences(series, sequence_length)
         
-        # Train model (force CPU for parallel training)
-        device = torch.device("cpu")
+        # Train model using the official training function
+        model = train_kan_model(
+            X_tensor,
+            y_tensor,
+            sequence_length=sequence_length,
+            num_epochs=num_epochs,
+            batch_size=batch_size,
+            learning_rate=learning_rate,
+            patience=5
+        )
         
-        dataset = TimeSeriesDatasetKAN(X_tensor, y_tensor)
-        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-        
-        model = KAN(width=[sequence_length, 16, 8, 1])
-        model.to(device)
-        
-        criterion = nn.MSELoss()
-        optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-        
-        # Early stopping variables
-        best_loss = float('inf')
-        patience_counter = 0
-        best_model_state = None
-        patience = 5
-        
-        model.train()
-        for epoch in range(num_epochs):
-            running_loss = 0.0
-            for inputs, targets in train_loader:
-                inputs, targets = inputs.to(device), targets.to(device)
-                
-                optimizer.zero_grad()
-                outputs = model(inputs)
-                
-                if targets.ndim == 1:
-                    targets = targets.unsqueeze(1)
-                
-                loss = criterion(outputs, targets)
-                loss.backward()
-                optimizer.step()
-                
-                running_loss += loss.item()
-            
-            avg_loss = running_loss / len(train_loader)
-            
-            if avg_loss < best_loss:
-                best_loss = avg_loss
-                patience_counter = 0
-                best_model_state = model.state_dict().copy()
-            else:
-                patience_counter += 1
-            
-            if patience_counter >= patience:
-                break
-        
-        # Restore best model
-        if best_model_state is not None:
-            model.load_state_dict(best_model_state)
-        
-        # Save to GCS
+        # Save model to GCS
         gcs_key = save_kan_model_to_gcs(
             model,
             commodity,
@@ -429,12 +388,17 @@ def _train_single_commodity(args):
             bucket_name=bucket_name,
         )
         
-        print(f"  [{commodity}] ✓ Training complete (best loss: {best_loss:.4f})")
+        if gcs_key:
+            print(f"  [{commodity}] ✓ Training complete and saved to GCS")
+        else:
+            print(f"  [{commodity}] ✓ Training complete (GCS save failed)")
         
         return (commodity, model, scaler, "Success")
         
     except Exception as exc:
         print(f"  [{commodity}] ✗ Error: {exc}")
+        import traceback
+        traceback.print_exc()
         return (commodity, None, None, str(exc))
 
 
