@@ -96,7 +96,7 @@ def train_kan_model(
     X_tensor: torch.Tensor,
     y_tensor: torch.Tensor,
     sequence_length: int = 30,
-    num_epochs: int = 20,
+    num_epochs: int = 30,
     batch_size: int = 64,
     learning_rate: float = 0.0001,
     patience: int = 5,
@@ -114,10 +114,21 @@ def train_kan_model(
     # Ensure tensors are 2D: (samples, features)
     if y_tensor.ndim == 1:
         y_tensor = y_tensor.unsqueeze(1)
-    
+
+    # Ensure dataset includes optional keys that some pykan versions expect
+    # (for example: 'test_input', 'test_label', 'val_input', 'val_label').
+    # Providing empty tensors for these keys avoids KeyError inside `.fit()`
+    # while keeping the training behavior unchanged.
+    empty_input = torch.empty((0, X_tensor.shape[1]), dtype=torch.float32, device=device)
+    empty_label = torch.empty((0, y_tensor.shape[1]), dtype=torch.float32, device=device)
+
     dataset = {
         'train_input': X_tensor.to(device),
-        'train_label': y_tensor.to(device)
+        'train_label': y_tensor.to(device),
+        'test_input': empty_input,
+        'test_label': empty_label,
+        'val_input': empty_input,
+        'val_label': empty_label,
     }
     
     # Initialize KAN model with pykan API
@@ -137,8 +148,7 @@ def train_kan_model(
             lr=learning_rate,
             lamb=0.0,  # No L1 regularization for time series
             lamb_entropy=0.0,  # No entropy regularization
-            display=False  # Suppress verbose output
-        )
+            )
         print(f"    Training complete")
     except Exception as e:
         print(f"    Warning: pykan .fit() failed ({e}), falling back to manual training")
@@ -389,11 +399,15 @@ def _train_single_commodity(args):
         )
         
         if gcs_key:
-            print(f"  [{commodity}] ✓ Training complete and saved to GCS")
+            print(f"  [{commodity}] ✓ Training complete and saved to GCS: {gcs_key}")
         else:
             print(f"  [{commodity}] ✓ Training complete (GCS save failed)")
-        
-        return (commodity, model, scaler, "Success")
+
+        # Return the GCS key and scaler only. The KAN model object may contain
+        # non-picklable callables (lambdas) which cause ProcessPool to fail when
+        # transferring the object back to the parent. Save the model in the
+        # worker and let the parent load it from GCS instead.
+        return (commodity, gcs_key, scaler, "Success")
         
     except Exception as exc:
         print(f"  [{commodity}] ✗ Error: {exc}")
@@ -515,16 +529,25 @@ def generate_and_save_kan_forecast(
         
         trained_models = {}
         trained_scalers = {}
-        
+
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(_train_single_commodity, args): args[0] 
+            futures = {executor.submit(_train_single_commodity, args): args[0]
                       for args in train_args}
-            
+
             for future in as_completed(futures):
-                commodity, model, scaler, status = future.result()
-                if model is not None and scaler is not None:
-                    trained_models[commodity] = model
-                    trained_scalers[commodity] = scaler
+                commodity, gcs_key, scaler, status = future.result()
+                if gcs_key is not None and scaler is not None:
+                    # Attempt to load the model back from GCS into this process.
+                    model = load_kan_model_from_gcs(
+                        commodity,
+                        sequence_length=sequence_length,
+                        bucket_name=bucket_name,
+                    )
+                    if model is not None:
+                        trained_models[commodity] = model
+                        trained_scalers[commodity] = scaler
+                    else:
+                        print(f"  [{commodity}] Warning: model saved to GCS but failed to load in parent")
                 elif status != "Success":
                     print(f"  [{commodity}] Failed: {status}")
         

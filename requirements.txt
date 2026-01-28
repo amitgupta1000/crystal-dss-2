@@ -103,3 +103,4 @@ rank_bm25==0.2.2
 voyageai==0.3.4
 uuid_utils==0.13.0
 openpyxl==3.1.5
+pykan==0.2.8

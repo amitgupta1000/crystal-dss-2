@@ -15,14 +15,35 @@ os.environ.setdefault("HF_HUB_DISABLE_SYMLINKS_WARNING", "1")
 from src import arima
 from src.fbprophet import generate_and_save_prophet_forecast
 from src.fbprophet_covariates import generate_and_save_prophet_covariate_forecast
-from src.timesfm import generate_and_save_timesfm_forecast
 from src.gru import generate_and_save_gru_forecast
 from src.kan import generate_and_save_kan_forecast
 from src.file_utils import save_dataframe_to_gcs, download_latest_csv_from_gcs
 import logging
 
 generate_and_save_combined_arima_forecast = arima.generate_and_save_combined_arima_forecast
-run_model_training = arima.run_model_training
+
+# Wrap ARIMA training so the training summary is printed immediately after it returns.
+arima_training_summary = None
+def _run_model_training_and_print(*args, **kwargs):
+    """Call ARIMA training, capture its summary, and print a short diagnostics line.
+
+    Returns the original training summary dict from `arima.run_model_training`.
+    """
+    global arima_training_summary
+    arima_training_summary = arima.run_model_training(*args, **kwargs)
+    if isinstance(arima_training_summary, dict) and arima_training_summary.get('evaluation_df') is not None:
+        eval_df = arima_training_summary['evaluation_df']
+        try:
+            print(
+                f"  • ARIMA training evaluations captured {eval_df.shape[0]} rows across {eval_df.shape[1]} columns"
+            )
+        except Exception:
+            # Be tolerant of unexpected shapes/types in evaluation_df
+            print("  • ARIMA training completed (evaluation_df present)")
+    return arima_training_summary
+
+# Expose wrapper under the original name so callers can remain unchanged
+run_model_training = _run_model_training_and_print
 
 # Suppress common SARIMA warnings
 warnings.filterwarnings("ignore", message="Non-invertible starting seasonal moving average")
@@ -226,6 +247,8 @@ if __name__ == '__main__':
 
     if '4' in selected_options:
         try:
+            from src.timesfm import generate_and_save_timesfm_forecast
+
             timesfm_combined_df, timesfm_gcs_prefix = generate_and_save_timesfm_forecast(
                 prices_df=prices_df,
                 commodity_columns=commodity_columns,
@@ -332,11 +355,7 @@ if __name__ == '__main__':
         print(
             f"  - {result['model']}: {result['status']} (GCS: {result['gcs_prefix']} | Dimensions: {dims})"
         )
-    if arima_training_summary and arima_training_summary.get('evaluation_df') is not None:
-        eval_df = arima_training_summary['evaluation_df']
-        print(
-            f"  • ARIMA training evaluations captured {eval_df.shape[0]} rows across {eval_df.shape[1]} columns"
-        )
+
     print("=" * 80)
 
 
