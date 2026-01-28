@@ -7,16 +7,156 @@ import numpy as np
 from datetime import date
 import time
 from src.file_utils import upload_excel_file, save_dataframe_to_gcs
+from google.cloud import storage
+from google.api_core import exceptions as _gcs_exceptions
+import io as _io
+import yfinance as yf
+import pandas as pd
+import time
 
 def build_dataframe(uploaded_file=None):
-    from google.cloud import storage
-    from google.api_core import exceptions as _gcs_exceptions
-    import io as _io
-    import yfinance as yf
-    import pandas as pd
-    import time
 
-    # If no uploaded_file provided, try interactive upload
+    # #=========1.create the globals dataframe#=================
+    ### List of Global Macro Commodities
+    symbols = ['^GSPC', '000001.SS', '^NSEI', '^IXIC', 'DX=F', 'JPY=X', 'INR=X', 'CL=F', 'NG=F', 'GC=F', 'SI=F', 'HG=F', 'ZN=F', ]
+
+    # Create a dictionary to map original commodity labels to desired ones
+    commodity_mapping = {
+        'HG=F': 'Copper', 'SI=F': 'Silver', 'GC=F': 'Gold', 'NG=F': 'Natural Gas',
+        'BZ=F': 'Brent Crude', 'CL=F': 'Crude Oil', 'INR=X': 'Indian Rupee','JPY=X': 'Japanese Yen',
+        'EURUSD=X': 'Euro', 'DX=F': 'USD Index', '^NSEI': 'Nifty 50', '^IXIC': 'NASDAQ',
+        '^GSPC': 'S&P 500','000001.SS': 'Shanghai Composite', 'ZN=F': 'US 10-Y BOND PRICE',
+    }
+
+    print("\n" + "="*80)
+    print("FETCHING YFINANCE DATA FOR GLOBAL COMMODITIES")
+    print("="*80 + "\n")
+    
+    all_data = {}
+    issues_found = []
+    
+    for symbol in symbols:
+        commodity_name = commodity_mapping.get(symbol, symbol)
+        
+        try:
+            print(f"Fetching {commodity_name} ({symbol})...")
+            ticker = yf.Ticker(symbol)
+            
+            # Fetch with auto_adjust to avoid split/dividend issues
+            data = ticker.history(period='6y', interval='1d', auto_adjust=True)
+            
+            if data.empty:
+                print(f"  ✗ NO DATA RETURNED for {commodity_name}")
+                issues_found.append(f"{commodity_name}: No data")
+                continue
+            
+            # Reset index and handle timezone
+            data = data.reset_index()
+            
+            # Remove timezone if present
+            if pd.api.types.is_datetime64tz_dtype(data['Date']):
+                data['Date'] = data['Date'].dt.tz_localize(None)
+            
+            data['date'] = pd.to_datetime(data['Date']).dt.strftime('%Y-%m-%d')
+            
+            # Check for duplicate dates BEFORE cleaning
+            duplicates_before = data['date'].duplicated().sum()
+            if duplicates_before > 0:
+                print(f"  ⚠ WARNING: {duplicates_before} DUPLICATE DATES found!")
+                issues_found.append(f"{commodity_name}: {duplicates_before} duplicate dates")
+            
+            # Remove duplicates (keep last)
+            data = data.drop_duplicates(subset=['date'], keep='last')
+            
+            # Check for invalid prices
+            invalid_prices = (data['Close'].isna() | (data['Close'] <= 0)).sum()
+            if invalid_prices > 0:
+                print(f"  ⚠ WARNING: {invalid_prices} invalid prices (null or ≤0)")
+                issues_found.append(f"{commodity_name}: {invalid_prices} invalid prices")
+                data = data[data['Close'].notna() & (data['Close'] > 0)]
+            
+            # Check for suspicious price patterns
+            price_changes = data['Close'].pct_change().abs()
+            large_jumps = (price_changes > 0.5).sum()  # >50% change
+            if large_jumps > 2:
+                print(f"  ⚠ WARNING: {large_jumps} large price jumps (>50% change)")
+                issues_found.append(f"{commodity_name}: {large_jumps} suspicious jumps")
+            
+            # Store data
+            all_data[commodity_name] = data[['date', 'Close']].copy()
+            
+            # Summary
+            print(f"  ✓ Rows: {len(data)}")
+            print(f"    Date range: {data['date'].iloc[0]} to {data['date'].iloc[-1]}")
+            print(f"    Latest price: ${data['Close'].iloc[-1]:.2f}")
+            
+            time.sleep(0.5)  # Rate limiting
+            
+        except Exception as e:
+            print(f"  ✗ ERROR fetching {commodity_name}: {e}")
+            issues_found.append(f"{commodity_name}: {str(e)}")
+    
+    # Merge all dataframes
+    print("\n" + "="*80)
+    print("COMBINING DATA INTO SINGLE DATAFRAME")
+    print("="*80 + "\n")
+    
+    if not all_data:
+        print("✗ NO DATA FETCHED - All symbols failed!")
+        GLOBALS_RAW = pd.DataFrame()
+    else:
+        combined = None
+        for name, df_temp in all_data.items():
+            df_renamed = df_temp.rename(columns={'Close': name})
+            if combined is None:
+                combined = df_renamed
+            else:
+                combined = pd.merge(combined, df_renamed, on='date', how='outer')
+        
+        # Sort by date
+        combined['date'] = pd.to_datetime(combined['date'])
+        combined = combined.sort_values('date')
+        
+        # Check for duplicate dates in combined dataframe
+        dup_dates_combined = combined['date'].duplicated().sum()
+        if dup_dates_combined > 0:
+            print(f"⚠ WARNING: {dup_dates_combined} DUPLICATE DATES IN COMBINED DATA!")
+            print("  Removing duplicates...")
+            combined = combined.drop_duplicates(subset=['date'], keep='last')
+        
+        combined['date'] = combined['date'].dt.strftime('%Y-%m-%d')
+        
+        # Forward fill and copy
+        combined = combined.ffill()
+        GLOBALS_RAW = combined.copy()
+        
+        # Quality summary
+        print(f"✓ Combined dataframe created:")
+        print(f"  Total rows: {len(GLOBALS_RAW)}")
+        print(f"  Columns: {len(GLOBALS_RAW.columns)}")
+        print(f"  Date range: {GLOBALS_RAW['date'].iloc[0]} to {GLOBALS_RAW['date'].iloc[-1]}")
+        print(f"  Missing values: {GLOBALS_RAW.drop(columns=['date']).isna().sum().sum()}")
+        
+        print(f"\nLast 10 rows:")
+        print(GLOBALS_RAW.tail(10))
+    
+    # Summary of issues
+    if issues_found:
+        print(f"\n{'='*80}")
+        print(f"DATA QUALITY ISSUES: {len(issues_found)} issues detected")
+        print("="*80)
+        for issue in issues_found:
+            print(f"  • {issue}")
+    else:
+        print(f"\n✅ NO ISSUES FOUND - All data looks clean!")
+    
+    print("\n" + "="*80 + "\n")
+
+    #=========2.upload PLATTS sheet#=================
+    import io
+    excel_file_name = None
+
+        # If no uploaded_file provided, try interactive upload
     if uploaded_file is None:
         try:
             uploaded_file = upload_excel_file()
@@ -28,38 +168,6 @@ def build_dataframe(uploaded_file=None):
             print(f"File upload step failed: {e}")
             uploaded_file = None
 
-    # #=========1.create the globals dataframe#=================
-    ### List of Global Macro Commodities
-    symbols = ['^GSPC', '000001.SS', 'DX=F', 'JPY=X', 'INR=X', '^NSEI', 'CL=F', 'NG=F', 'GC=F', 'SI=F', 'HG=F', 'ZN=F', ]
-
-    # Create a dictionary to map original commodity labels to desired ones
-    commodity_mapping = {
-        'HG=F': 'Copper', 'SI=F': 'Silver', 'GC=F': 'Gold', 'NG=F': 'Natural Gas',
-        'BZ=F': 'Brent Crude', 'CL=F': 'Crude Oil', 'INR=X': 'Indian Rupee','JPY=X': 'Japanese Yen',
-        'EURUSD=X': 'Euro', 'DX=F': 'USD Index', '^NSEI': 'Nifty 50', '^IXIC': 'NASDAQ',
-        '^GSPC': 'S&P 500','000001.SS': 'Shanghai Composite', 'ZN=F': 'US 10-Y BOND PRICE',
-    }
-
-    all_close_data = pd.DataFrame()
-    for commodity in symbols:
-        try:
-            ticker = yf.Ticker(commodity)
-            data = ticker.history(period='6y', interval='1d')
-            data = data.reset_index()
-            data['date'] = data['Date'].dt.strftime('%Y-%m-%d')
-            close_data = data[['date', 'Close']].rename(columns=lambda x: f"{commodity_mapping.get(commodity, commodity)}" if x == 'Close' else x)
-            all_close_data = pd.concat([all_close_data, close_data], axis=1)
-            time.sleep(2)
-        except Exception as e:
-            print(f"Error fetching data for {commodity}: {e}")
-
-    df = all_close_data.loc[:,~all_close_data.columns.duplicated(keep='first')].copy()
-    df = df.ffill()
-    GLOBALS_RAW = df.copy()
-
-    #=========2.upload PLATTS sheet#=================
-    import io
-    excel_file_name = None
 
     if uploaded_file:
         excel_file_name = next(iter(uploaded_file))
@@ -155,13 +263,13 @@ def build_dataframe(uploaded_file=None):
 
     # --- New code to clean PLATTS headers ---
     # Define a list of keywords to look for
-    keywords = ['DAP', 'FCA', 'FOB', 'CIF', 'ARA', 'CFR', 'FCA']
+    keywords = ['CFR Taiwan/China Marker (NextGen MOC)', 'Pressurized', 'Refrigerated', 'DAP', 'FCA', 'FOB', 'CIF', 'ARA', 'CFR', 'FCA']
 
     def clean_platts_header(header):
         if header == 'date':  # Keep 'date' column name as is
             return header
         for keyword in keywords:
-            if keyword in header.upper():  # Check for keyword (case-insensitive)
+            if keyword in header:  # Check for keyword (case-insensitive)
                 # Find the index of the keyword and take the part before it
                 return header.split(keyword)[0].strip()
         return header  # Return original header if no keyword is found
@@ -219,4 +327,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-    
