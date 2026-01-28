@@ -136,35 +136,8 @@ if __name__ == '__main__':
     )
 
     model_results = []
-    arima_training_summary = None
 
     if '1' in selected_options:
-        print("\n" + "="*80)
-        print("ARIMA CONFIGURATION")
-        print("="*80)
-        print("\nDo you want to:")
-        print("  1. Load saved models from GCS (faster)")
-        print("  2. Run new ARIMA grid search and train models (slower, more accurate)")
-        arima_choice = input("\nEnter your choice (1 or 2): ").strip()
-
-        if arima_choice == '2':
-            arima_training_summary = run_model_training(
-                prices_df=prices_df,
-                commodity_columns=commodity_columns,
-                bucket_name=bucket_name,
-            )
-        elif arima_choice == '1':
-            print("\n" + "="*80)
-            print("Loading Saved Models from GCS")
-            print("="*80)
-            print("Models will be loaded during forecasting...")
-        else:
-            print("\nInvalid choice. Defaulting to loading saved models.")
-            print("\n" + "="*80)
-            print("Loading Saved Models from GCS")
-            print("="*80)
-            print("Models will be loaded during forecasting...")
-
         try:
             arima_combined_df, arima_gcs_prefix = arima.generate_and_save_combined_arima_forecast(
                 prices_df=prices_df,

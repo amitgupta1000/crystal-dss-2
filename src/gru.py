@@ -604,18 +604,28 @@ def generate_and_save_gru_forecast(
     forecast_df = pd.DataFrame(all_forecasts, index=forecast_dates)
     forecast_df.index.name = 'Date'
     
-    # Add forecast date column
-    forecast_df.insert(0, 'Forecast Date', forecast_dates.strftime('%Y-%m-%d'))
-    
     print(f"\n✓ Forecast dataframe created")
     print(f"  Shape: {forecast_df.shape}")
     print(f"  Commodities: {len(all_forecasts)}")
     print(f"  Date range: {forecast_dates[0]} to {forecast_dates[-1]}")
     
-    # Save to GCS
-    print(f"\nSaving to GCS: {gcs_prefix}")
+    # Combine historical data with forecast
+    print(f"\nCombining historical data with forecast...")
+    historical_df = prices_df[list(all_forecasts.keys())].copy()
+    combined_df = pd.concat([historical_df, forecast_df], axis=0, join='outer')
+    combined_df.sort_index(inplace=True)
+    combined_df.index.name = 'Date'
+    
+    print(f"  Historical data points: {len(historical_df)}")
+    print(f"  Forecast data points: {len(forecast_df)}")
+    print(f"  Combined shape: {combined_df.shape}")
+    print(f"  Date range: {combined_df.index.min()} to {combined_df.index.max()}")
+    
+    # Save combined dataframe to GCS
+    print(f"\nSaving combined historical + forecast to GCS: {gcs_prefix}")
+    combined_df_to_save = combined_df.reset_index()
     save_dataframe_to_gcs(
-        df=forecast_df.reset_index(drop=True),
+        df=combined_df_to_save,
         bucket_name=bucket_name,
         gcs_prefix=gcs_prefix,
         validate_rows=False,
@@ -625,4 +635,4 @@ def generate_and_save_gru_forecast(
     print("GRU FORECASTING COMPLETE")
     print("="*80 + "\n")
     
-    return forecast_df, gcs_prefix
+    return combined_df, gcs_prefix
