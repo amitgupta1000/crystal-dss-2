@@ -286,6 +286,65 @@ def build_dataframe(uploaded_file=None):
     concatenated_df = concatenated_df.sort_values(by='date', ascending=True)
     concatenated_df['date'] = concatenated_df['date'].dt.strftime('%d-%m-%y')
 
+    #=========4. Calculate spreads (differences)#=================
+    print("\n" + "="*80)
+    print("CALCULATING SPREADS")
+    print("="*80 + "\n")
+    
+    # Spread 1: Crude Oil vs. Naphtha (convert Crude Oil $/barrel to $/kg by dividing by 135)
+    if 'Crude Oil' in concatenated_df.columns and 'Naphtha' in concatenated_df.columns:
+        concatenated_df['SPREAD: Crude Oil - Naphtha'] = (
+            (pd.to_numeric(concatenated_df['Crude Oil'], errors='coerce') / 135) - 
+            pd.to_numeric(concatenated_df['Naphtha'], errors='coerce')
+        )
+        print("✓ Calculated: SPREAD: Crude Oil - Naphtha (Crude Oil converted to $/kg)")
+    else:
+        print("⚠ WARNING: Could not calculate Crude Oil - Naphtha spread (missing columns)")
+    
+    # Spread 2: Benzene vs. Styrene
+    if 'Benzene' in concatenated_df.columns and 'Styrene' in concatenated_df.columns:
+        concatenated_df['SPREAD: Benzene - Styrene'] = (
+            pd.to_numeric(concatenated_df['Benzene'], errors='coerce') - 
+            pd.to_numeric(concatenated_df['Styrene'], errors='coerce')
+        )
+        print("✓ Calculated: SPREAD: Benzene - Styrene")
+    else:
+        print("⚠ WARNING: Could not calculate Benzene - Styrene spread (missing columns)")
+    
+    # Spread 3: Propylene vs. PP Inj
+    if 'Propylene Poly Grade' in concatenated_df.columns and 'PP Inj' in concatenated_df.columns:
+        concatenated_df['SPREAD: Propylene - PP Inj'] = (
+            pd.to_numeric(concatenated_df['Propylene Poly Grade'], errors='coerce') - 
+            pd.to_numeric(concatenated_df['PP Inj'], errors='coerce')
+        )
+        print(f"✓ Calculated: SPREAD: Propylene - PP Inj (using 'Propylene Poly Grade' column)")
+    else:
+        print(f"⚠ WARNING: Could not calculate Propylene - PP Inj spread")
+
+
+    # Spread 4: Paraxylene vs. PET
+    if 'Paraxylene' in concatenated_df.columns and 'Recycled-PET Clear Flakes' in concatenated_df.columns:
+        concatenated_df['SPREAD: Paraxylene - PET'] = (
+            pd.to_numeric(concatenated_df['Paraxylene'], errors='coerce') - 
+            pd.to_numeric(concatenated_df['Recycled-PET Clear Flakes'], errors='coerce')
+        )
+        print("✓ Calculated: SPREAD: Paraxylene - PET")
+    else:
+        print("⚠ WARNING: Could not calculate Paraxylene - PET spread (missing columns)")
+    
+
+    # Spread 5: Ethylene vs. Polyethylene
+    if 'Ethylene' in concatenated_df.columns and 'HDPE Film' in concatenated_df.columns:
+        concatenated_df['SPREAD: Ethylene - HDPE'] = (
+            pd.to_numeric(concatenated_df['Ethylene'], errors='coerce') - 
+            pd.to_numeric(concatenated_df['HDPE Film'], errors='coerce')
+        )
+        print("✓ Calculated: SPREAD: Ethylene - HDPE")
+    else:
+        print("⚠ WARNING: Could not calculate Ethylene - HDPE spread (missing columns)")
+    
+    print("\n" + "="*80 + "\n")
+
     print("\nHead of the concatenated DataFrame:")
     print(concatenated_df.head())
     print("\nShape of the concatenated DataFrame:")
