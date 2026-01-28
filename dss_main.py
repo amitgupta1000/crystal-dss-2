@@ -17,6 +17,7 @@ from src.fbprophet import generate_and_save_prophet_forecast
 from src.fbprophet_covariates import generate_and_save_prophet_covariate_forecast
 from src.timesfm import generate_and_save_timesfm_forecast
 from src.gru import generate_and_save_gru_forecast
+from src.kan import generate_and_save_kan_forecast
 from src.file_utils import save_dataframe_to_gcs, download_latest_csv_from_gcs
 import logging
 
@@ -107,21 +108,22 @@ if __name__ == '__main__':
     print("  3. FB Prophet with Covariates")
     print("  4. TimesFM")
     print("  5. GRU")
-    print("  6. All of the above (sequential)")
-    selection_input = input("\nEnter selection (e.g., 1 or 1,3 or 6 for all): ").strip()
+    print("  6. KAN")
+    print("  7. All of the above (sequential)")
+    selection_input = input("\nEnter selection (e.g., 1 or 1,3 or 7 for all): ").strip()
 
     tokens = [token.strip() for token in selection_input.split(',') if token.strip()]
     selected_options = []
     for token in tokens:
-        if token == '6':
-            selected_options = ['1', '2', '3', '4', '5']
+        if token == '7':
+            selected_options = ['1', '2', '3', '4', '5', '6']
             break
-        if token in {'1', '2', '3', '4', '5'} and token not in selected_options:
+        if token in {'1', '2', '3', '4', '5', '6'} and token not in selected_options:
             selected_options.append(token)
     if not selected_options:
-        selected_options = ['1', '2', '3', '4', '5']
+        selected_options = ['1', '2', '3', '4', '5', '6']
 
-    run_all_selected = set(selected_options) == {'1', '2', '3', '4', '5'}
+    run_all_selected = set(selected_options) == {'1', '2', '3', '4', '5', '6'}
 
     print("\n" + "=" * 80)
     print("Generating Forecasts with Confidence Intervals")
@@ -308,9 +310,38 @@ if __name__ == '__main__':
                 }
             )
 
+    if '6' in selected_options:
+        try:
+            kan_combined_df, kan_gcs_prefix = generate_and_save_kan_forecast(
+                prices_df=prices_df,
+                commodity_columns=commodity_columns,
+                forecast_steps=forecast_steps,
+                gcs_prefix='forecast_data/kan_forecast.csv',
+                train_new_models=False,  # Auto: load if exists, train if not
+                conf_interval_05=True,
+                conf_interval_10=True,
+                bucket_name=bucket_name,
+            )
+            model_results.append(
+                {
+                    'model': 'KAN',
+                    'gcs_prefix': kan_gcs_prefix,
+                    'rows': kan_combined_df.shape[0],
+                    'columns': kan_combined_df.shape[1],
+                    'status': 'Completed',
+                }
+            )
+        except Exception as exc:
+            model_results.append(
+                {
+                    'model': 'KAN',
+                    'gcs_prefix': 'n/a',
+                    'status': f'Failed: {exc}',
+                }
+            )
+
     if run_all_selected:
         additional_models = [
-            'KAN',
             'MAMBA',
         ]
         for model_name in additional_models:
