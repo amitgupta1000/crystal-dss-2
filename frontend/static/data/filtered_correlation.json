@@ -1,0 +1,6 @@
+[
+  {"source":"Crude Oil","target":"Acetic Acid","corr":0.78},
+  {"source":"Ethylene","target":"Acetic Acid","corr":0.62},
+  {"source":"Naphtha","target":"Toluene","corr":0.71},
+  {"source":"Crude Oil","target":"Toluene","corr":0.65}
+]

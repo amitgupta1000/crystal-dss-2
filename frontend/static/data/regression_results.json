@@ -1,0 +1,7 @@
+{
+  "metrics": {"MAE": 1.23, "MAPE": 2.1},
+  "results": [
+    {"Target Commodity":"Acetic Acid","Degree":1,"Features Used":["Crude Oil","Ethylene"],"Train Adj R2":0.72,"Test Adj R2":0.68,"Train RMSE":1.1,"Test RMSE":1.4},
+    {"Target Commodity":"Toluene","Degree":2,"Features Used":["Naphtha","Crude Oil"],"Train Adj R2":0.64,"Test Adj R2":0.60,"Train RMSE":1.9,"Test RMSE":2.2}
+  ]
+}

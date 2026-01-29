@@ -1,0 +1,5 @@
+[
+  {"Source":"Crude Oil","Target":"Acetic Acid","Lag":2,"P-value (F-test)":0.003,"Statistic":6.12},
+  {"Source":"Ethylene","Target":"Acetic Acid","Lag":1,"P-value (F-test)":0.02,"Statistic":4.33},
+  {"Source":"Naphtha","Target":"Toluene","Lag":3,"P-value (F-test)":0.10,"Statistic":2.10}
+]

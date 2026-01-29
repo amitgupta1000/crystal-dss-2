@@ -1,0 +1,9 @@
+[
+  {"timestamp":"2025-12-01","actual":120.5,"forecast":118.0},
+  {"timestamp":"2025-12-08","actual":123.4,"forecast":122.0},
+  {"timestamp":"2025-12-15","actual":125.0,"forecast":124.0},
+  {"timestamp":"2025-12-22","actual":127.1,"forecast":126.5},
+  {"timestamp":"2025-12-29","actual":130.3,"forecast":129.0},
+  {"timestamp":"2026-01-05","actual":131.0,"forecast":132.0},
+  {"timestamp":"2026-01-12","actual":129.8,"forecast":131.5}
+]

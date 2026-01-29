@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Dashboard - Prototype</title>
+  <link rel="stylesheet" href="styles.css">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Forecast Dashboard (Prototype)</h1>
+    <nav>
+      <a href="index.html">Dashboard</a>
+      <a href="models.html">Models</a>
+      <a href="forecast.html">Forecast Viz</a>
+      <a href="settings.html">Settings</a>
+    </nav>
+  </header>
+
+  <main class="grid">
+    <section class="kpis">
+      <div class="kpi" id="kpi-forecast">
+        <div class="label">Next Forecast</div>
+        <div class="value" id="nextForecast">—</div>
+        <canvas id="sparkline" height="40"></canvas>
+      </div>
+      <div class="kpi" id="kpi-mae">
+        <div class="label">MAE</div>
+        <div class="value" id="kpiMAE">—</div>
+      </div>
+      <div class="kpi" id="kpi-mape">
+        <div class="label">MAPE</div>
+        <div class="value" id="kpiMAPE">—</div>
+      </div>
+      <div class="kpi" id="kpi-last-update">
+        <div class="label">Last Update</div>
+        <div class="value" id="kpiLastUpdate">—</div>
+      </div>
+    </section>
+
+    <section class="chart">
+      <h2>Actual vs Forecast</h2>
+      <canvas id="mainChart" height="200"></canvas>
+    </section>
+
+    <section class="models">
+      <h2>Models</h2>
+      <ul id="modelsList">Loading…</ul>
+    </section>
+
+    <section class="horizon">
+      <h2>Forecast Horizon</h2>
+      <table id="horizonTable">
+        <thead><tr><th>Timestamp</th><th>Forecast</th><th>Lower</th><th>Upper</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+  </main>
+
+  <script src="scripts.js"></script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+[
+  {"name":"Acetic Acid","version":"0.1","status":"OK","last_run":"2026-01-28"},
+  {"name":"Butyl Acetate","version":"0.1","status":"OK","last_run":"2026-01-26"},
+  {"name":"Toluene","version":"0.2","status":"Warning","last_run":"2026-01-20"}
+]
