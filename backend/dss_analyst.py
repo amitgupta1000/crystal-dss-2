@@ -45,7 +45,8 @@ def main():
     prices_df.dropna(axis=0, how='all', inplace=True)
     logger.info('Shape after dropping empty rows/columns: %s', prices_df.shape)
 
-    # Correlation
+    # Correlation #===============================================================
+    logger.info('Starting correlation analysis...')
     window = 12
     cor_results = compute_correlations(prices_df, window=window, interpolate_method='time')
 
@@ -95,7 +96,8 @@ def main():
     except Exception:
         logger.exception('Failed to compute or save rolling correlation drift analysis.')
 
-    # Causality
+    # Causality #================================================================
+    logger.info('Preparing data for Granger causality tests...')
     stationary_df = prepare_causality_data(prices_df) 
     alpha = 0.04
     # Define a more focused set of lags for faster processing (1w, 2w, 1m, 1q)
@@ -111,22 +113,14 @@ def main():
     # Save Granger results
     if isinstance(all_granger_test_results_df, pd.DataFrame) and not all_granger_test_results_df.empty:
         logger.info('Saving all_granger_test_results_df to GCS...')
-        gcs_prefix_granger_results = f'{stats_studies_prefix}causality//all_granger_test_results.csv'
+        gcs_prefix_granger_results = f'{stats_studies_prefix}/causality/all_granger_test_results.csv'
         save_dataframe_to_gcs(df=all_granger_test_results_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix_granger_results, validate_rows=False)
         logger.info('Saved Granger results to GCS: %s', gcs_prefix_granger_results)
     else:
         logger.warning("'all_granger_test_results_df' not available or empty; skipping save")
 
-    # Filter causality
-    if not isinstance(all_granger_test_results_df, pd.DataFrame) or all_granger_test_results_df.empty:
-        logger.warning("'all_granger_test_results_df' not found or empty. Cannot filter causality results.")
-        filtered_causality_df = pd.DataFrame()
-    else:
-        logger.info('Filtering causality relationships to find sources for target commodities...')
-        most_significant_lags = all_granger_test_results_df.loc[all_granger_test_results_df.groupby(['Source', 'Target'])['P-value (F-test)'].idxmin()].copy()
-        most_significant_lags = most_significant_lags[most_significant_lags['P-value (F-test)'] < alpha]
-
-    # Regression
+    # Regression #====================================================================
+    logger.info('Preparing data for regression analysis...')    
     prices_df_local = prices_df.copy()
     numerical_price_features_df = prices_df_local.select_dtypes(include=np.number)
     logger.info('Numeric features shape: %s', numerical_price_features_df.shape)
@@ -152,7 +146,7 @@ def main():
 
 
     logger.info('Running regression models for target commodities...')
-    regression_models_prefix = f'{models_prefix}/regression'
+    regression_models_prefix = 'models/regression'
     logger.info('Regression models will be saved to: gs://%s/%s', bucket_name, regression_models_prefix)
     
     regression_results = run_regression_models(
@@ -167,16 +161,16 @@ def main():
     logger.info('Regression results summary:\n%s', regression_results_df[['Target Commodity', 'Degree', 'Features Used Count', 'Train Adj R2', 'Test Adj R2', 'Train RMSE', 'Test RMSE']].head())
 
     if not regression_results_df.empty:
-        gcs_prefix_regressions_results = f'{stats_studies_prefix}/regression_results_matrix.csv'
+        gcs_prefix_regressions_results = f'{stats_studies_prefix}/regression/regression_results_matrix.csv'
         save_dataframe_to_gcs(df=regression_results_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix_regressions_results, validate_rows=False)
         logger.info('Saved regression results to GCS: %s', gcs_prefix_regressions_results)
     else:
         logger.info('No regression results to save')
 
-    # Seasonality
-
+    # Seasonality #==================================================================== 
+    logger.info('Preparing data for seasonality analysis...')
     logger.info('Running seasonality analysis...')
-    gcs_seasonality_decomposition_prefix = f'{stats_studies_prefix}/seasonality_decompositions'
+    gcs_seasonality_decomposition_prefix = f'{stats_studies_prefix}/seasonality/seasonality_decompositions'
     seasonality_results_df_flattened, seasonality_summary_table_df = run_seasonality_analysis(
         prices_df, num_top_periods_to_analyze=6,
         gcs_bucket_name=bucket_name,
@@ -185,7 +179,7 @@ def main():
 
     if seasonality_results_df_flattened is not None and not seasonality_results_df_flattened.empty:
         logger.info('Saving seasonality_results_df_flattened to GCS...')
-        gcs_prefix_seasonality = f'{stats_studies_prefix}/seasonality_results.csv'
+        gcs_prefix_seasonality = f'{stats_studies_prefix}/seasonality/seasonality_results.csv'
         save_dataframe_to_gcs(df=seasonality_results_df_flattened, bucket_name=bucket_name, gcs_prefix=gcs_prefix_seasonality, validate_rows=False)
         logger.info('Saved seasonality results to GCS: %s', gcs_prefix_seasonality)
     else:
@@ -193,7 +187,7 @@ def main():
 
     if seasonality_summary_table_df is not None and not seasonality_summary_table_df.empty:
         logger.info('Seasonality summary (top rows):\n%s', seasonality_summary_table_df.head())
-        gcs_prefix_seasonality_summary = f'{stats_studies_prefix}/seasonality_summary.csv'
+        gcs_prefix_seasonality_summary = f'{stats_studies_prefix}/seasonality/seasonality_summary.csv'
         save_dataframe_to_gcs(df=seasonality_summary_table_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix_seasonality_summary, validate_rows=False, include_index=True)
         logger.info('Saved seasonality summary to GCS: %s', gcs_prefix_seasonality_summary)
     else:
