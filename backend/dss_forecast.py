@@ -16,7 +16,7 @@ from src import arima
 from src.fbprophet import generate_and_save_prophet_forecast
 from src.fbprophet_covariates import generate_and_save_prophet_covariate_forecast
 from src.gru import generate_and_save_gru_forecast
-from src.kan import generate_and_save_kan_forecast
+from src.kan_multivariate import generate_and_save_kan_multivariate_forecast
 from src.mamba import generate_and_save_mamba_forecast
 from src.file_utils import save_dataframe_to_gcs, download_latest_csv_from_gcs
 import logging
@@ -136,7 +136,7 @@ if __name__ == '__main__':
     print("  3. FB Prophet with Covariates")
     print("  4. TimesFM")
     print("  5. GRU")
-    print("  6. KAN")
+    print("  6. KAN (Unified Multivariate)")
     print("  7. MAMBA (Unified Multivariate)")
     print("  8. All of the above (sequential)")
     selection_input = input("\nEnter selection (e.g., 1 or 1,3,7 or 8 for all): ").strip()
@@ -316,20 +316,22 @@ if __name__ == '__main__':
 
     if '6' in selected_options:
         try:
-            kan_combined_df, kan_gcs_prefix = generate_and_save_kan_forecast(
+            kan_combined_df, kan_gcs_prefix = generate_and_save_kan_multivariate_forecast(
                 prices_df=prices_df,
                 commodity_columns=commodity_columns,
                 forecast_steps=forecast_steps,
-                gcs_prefix='forecast_data/kan_forecast.csv',
-                train_new_models=False,  # Auto: load if exists, train if not
-                num_epochs=100,
-                conf_interval_05=True,
-                conf_interval_10=True,
+                gcs_prefix='forecast_data/kan_multivariate_forecast.csv',
+                train_new_model=False,  # Auto: load if exists, train if not
+                sequence_length=21,
+                num_epochs=30,
+                batch_size=32,
+                learning_rate=0.001,
+                hidden_units=(32, 16),
                 bucket_name=bucket_name,
             )
             model_results.append(
                 {
-                    'model': 'KAN',
+                    'model': 'KAN (Multivariate)',
                     'gcs_prefix': kan_gcs_prefix,
                     'rows': kan_combined_df.shape[0],
                     'columns': kan_combined_df.shape[1],
@@ -339,7 +341,7 @@ if __name__ == '__main__':
         except Exception as exc:
             model_results.append(
                 {
-                    'model': 'KAN',
+                    'model': 'KAN (Multivariate)',
                     'gcs_prefix': 'n/a',
                     'status': f'Failed: {exc}',
                 }
