@@ -24,7 +24,8 @@ def calculate_rmse(y_true, y_pred):
 def run_regression_models(numerical_price_features_diff_df,
                           commodities,
                           target_commodities,
-                          output_dir,
+                          bucket_name='crystal-dss',
+                          models_prefix='models/regression',
                           degrees_to_test=None,
                           top_n=8,
                           max_features_for_poly=8):
@@ -101,41 +102,45 @@ def run_regression_models(numerical_price_features_diff_df,
 
             # --- Save model and transformers for scenario analysis ---
             model_id = f"{target_commodity}_deg{degree}"
+            
+            # Create metadata for full reconstruction
+            metadata = {
+                'target_commodity': target_commodity,
+                'degree': degree,
+                'alpha': 1.0,  # Ridge alpha parameter
+                'features': current_features,
+                'feature_count': len(current_features),
+                'train_adj_r2': adj_r2_train,
+                'test_adj_r2': adj_r2_test,
+                'train_rmse': rmse_train,
+                'test_rmse': rmse_test,
+                'intercept': float(model.intercept_),
+            }
+            
             artifacts = {
                 'model': model,
                 'scaler': scaler,
                 'poly': poly,
-                'features': current_features,
+                'metadata': metadata,
             }
             artifact_paths = {}
 
-            if output_dir.startswith('gs://'):
-                # Save to Google Cloud Storage
-                try:
-                    storage_client = storage.Client()
-                    parsed_url = urlparse(output_dir)
-                    bucket_name = parsed_url.netloc
-                    prefix = parsed_url.path.lstrip('/')
-                    bucket = storage_client.bucket(bucket_name)
+            # Save to Google Cloud Storage
+            try:
+                storage_client = storage.Client()
+                bucket = storage_client.bucket(bucket_name)
 
-                    for name, obj in artifacts.items():
-                        blob_name = os.path.join(prefix, f"{model_id}_{name}.joblib")
-                        blob = bucket.blob(blob_name)
-                        with io.BytesIO() as buffer:
-                            joblib.dump(obj, buffer)
-                            buffer.seek(0)
-                            blob.upload_from_file(buffer, content_type='application/octet-stream')
-                        artifact_paths[name] = f"gs://{bucket_name}/{blob_name}"
-                except Exception as e:
-                    print(f"Error uploading to GCS: {e}")
-                    continue  # Skip this model if upload fails
-            else:
-                # Save to local filesystem
-                os.makedirs(output_dir, exist_ok=True)
                 for name, obj in artifacts.items():
-                    path = os.path.join(output_dir, f"{model_id}_{name}.joblib")
-                    joblib.dump(obj, path)
-                    artifact_paths[name] = path
+                    blob_name = f"{models_prefix}/{model_id}_{name}.joblib"
+                    blob = bucket.blob(blob_name)
+                    with io.BytesIO() as buffer:
+                        joblib.dump(obj, buffer)
+                        buffer.seek(0)
+                        blob.upload_from_file(buffer, content_type='application/octet-stream')
+                    artifact_paths[name] = f"gs://{bucket_name}/{blob_name}"
+            except Exception as e:
+                print(f"Error uploading to GCS: {e}")
+                continue  # Skip this model if upload fails
             # -------------------------------------------------------------
 
             result_entry = {
@@ -151,7 +156,7 @@ def run_regression_models(numerical_price_features_diff_df,
                 'Model Path': artifact_paths['model'],
                 'Scaler Path': artifact_paths['scaler'],
                 'Poly Path': artifact_paths['poly'],
-                'Features Path': artifact_paths['features'],
+                'Metadata Path': artifact_paths['metadata'],
             }
 
             for i, (feature_name, coefficient_value) in enumerate(top_coefficients_with_values.items()):

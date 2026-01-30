@@ -25,21 +25,6 @@ def main():
     stats_studies_prefix = 'stats_studies_data'
     models_prefix = 'models'
 
-    # Define the target commodities
-    target_commodities = [
-        'Acetic Acid', 'Butyl Acetate', 'Toluene', 'Isomer-MX', 'Solvent-MX', 'Methanol',
-        'MTBE', 'Benzene'
-    ]
-
-    # Define the other commodities to correlate against
-    other_commodities = [
-        'Gold', 'Silver', 'Copper', 'S&P 500', 'Shanghai Composite', 'USD Index',
-        'Japanese Yen', 'US 10-Y BOND PRICE', 'Crude Oil', 'Natural Gas', 'Naphtha',
-        'EDC', 'Ethylene', 'Propylene', 'N-Butanol', 'Paraxylene', 'OrthXylene',
-        'Cyclohexane', 'Styrene', 'DEG', '2 EH', 'Acetic Acid', 'Butyl Acetate',
-        'Toluene', 'Isomer-MX', 'Solvent-MX', 'Methanol', 'MTBE', 'Benzene'
-    ]
-
     prices_df = download_latest_csv_from_gcs(bucket_name=bucket_name, gcs_prefix=cleaned_data_prefix)
     logger.info('Downloaded latest cleaned DataFrame from GCS.')
 
@@ -86,22 +71,6 @@ def main():
     save_dataframe_to_gcs(df=correlation_matrix, bucket_name=bucket_name, gcs_prefix=gcs_prefix_correlation, validate_rows=False, include_index=True)
     logger.info('Saved full correlation matrix to GCS: %s', gcs_prefix_correlation)
 
-    # Build filtered correlation matrix using the correlation module
-    try:
-        filtered_correlation_df = build_filtered_correlation_matrix(pairwise_corr_df, correlation_matrix, target_commodities, other_commodities)
-        gcs_prefix_filtered_corr_matrix = f'{stats_studies_prefix}/correlations/filtered_correlation_matrix.csv'
-        if filtered_correlation_df.empty:
-            logger.info('Filtered correlation matrix is empty — no valid targets/others found or no correlation data available.')
-        else:
-            logger.info('Filtered Correlation Matrix preview:\n%s', filtered_correlation_df.head(5))
-            try:
-                save_dataframe_to_gcs(df=filtered_correlation_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix_filtered_corr_matrix, validate_rows=False, include_index=True)
-                logger.info('Saved filtered correlation matrix to GCS: %s', gcs_prefix_filtered_corr_matrix)
-            except Exception:
-                logger.exception('Failed to save filtered correlation matrix to GCS')
-    except Exception:
-        logger.exception('Error building filtered correlation matrix')
-
     # --- Correlation Drift Analysis ---
     logger.info('Starting correlation drift analysis...')
     correlation_drift_window = 250  # e.g., 250-day (approx. 1 year) rolling correlation
@@ -130,7 +99,7 @@ def main():
     stationary_df = prepare_causality_data(prices_df) 
     alpha = 0.04
     # Define a more focused set of lags for faster processing (1w, 2w, 1m, 1q)
-    lags_to_test = [5, 10, 21, 63] 
+    lags_to_test = [5, 10, 21, 63, 186] 
     logger.info('Alpha (significance level): %s; Lags to test: %s', alpha, lags_to_test)
 
     logger.info('Performing Granger causality tests...')
@@ -142,7 +111,7 @@ def main():
     # Save Granger results
     if isinstance(all_granger_test_results_df, pd.DataFrame) and not all_granger_test_results_df.empty:
         logger.info('Saving all_granger_test_results_df to GCS...')
-        gcs_prefix_granger_results = f'{stats_studies_prefix}/all_granger_test_results.csv'
+        gcs_prefix_granger_results = f'{stats_studies_prefix}causality//all_granger_test_results.csv'
         save_dataframe_to_gcs(df=all_granger_test_results_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix_granger_results, validate_rows=False)
         logger.info('Saved Granger results to GCS: %s', gcs_prefix_granger_results)
     else:
@@ -156,17 +125,6 @@ def main():
         logger.info('Filtering causality relationships to find sources for target commodities...')
         most_significant_lags = all_granger_test_results_df.loc[all_granger_test_results_df.groupby(['Source', 'Target'])['P-value (F-test)'].idxmin()].copy()
         most_significant_lags = most_significant_lags[most_significant_lags['P-value (F-test)'] < alpha]
-
-        filtered_causality_df = most_significant_lags[most_significant_lags['Source'].isin(other_commodities) & most_significant_lags['Target'].isin(target_commodities)].copy()
-
-        if not filtered_causality_df.empty:
-            filtered_causality_df = filtered_causality_df.sort_values(by=['Target', 'P-value (F-test)']).reset_index(drop=True)
-            logger.info('Filtered Causality Table (Sources for Target Commodities):\n%s', filtered_causality_df)
-            gcs_prefix_casuality_matrix = f'{stats_studies_prefix}/filtered_causality_matrix.csv'
-            save_dataframe_to_gcs(df=filtered_causality_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix_casuality_matrix, validate_rows=False)
-            logger.info('Saved filtered causality matrix to GCS: %s', gcs_prefix_casuality_matrix)
-        else:
-            logger.info('No significant filtered causal relationships found for target commodities.')
 
     # Regression
     prices_df_local = prices_df.copy()
@@ -193,14 +151,14 @@ def main():
     logger.info('Target commodities present: %s', len(target_commodities))
 
 
-    # Define GCS path for saving regression models and artifacts
-    gcs_regression_models_path = f'gs://{bucket_name}/{models_prefix}/regression'
-    logger.info('Regression models will be saved to: %s', gcs_regression_models_path)
-
     logger.info('Running regression models for target commodities...')
+    regression_models_prefix = f'{models_prefix}/regression'
+    logger.info('Regression models will be saved to: gs://%s/%s', bucket_name, regression_models_prefix)
+    
     regression_results = run_regression_models(
         numerical_price_features_diff_df, commodities, target_commodities,
-        output_dir=gcs_regression_models_path,
+        bucket_name=bucket_name,
+        models_prefix=regression_models_prefix,
         degrees_to_test=[1, 2, 3], top_n=8, max_features_for_poly=8
     )
     logger.info('Completed regressions: %s model results collected.', len(regression_results))
