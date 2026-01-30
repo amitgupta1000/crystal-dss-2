@@ -1,86 +1,97 @@
 import os
 import contextlib
-from contextlib import contextmanager
 import pandas as pd
 import numpy as np
 import logging
 from sklearn.preprocessing import StandardScaler
-from statsmodels.tsa.stattools import grangercausalitytests
+from statsmodels.tsa.stattools import grangercausalitytests, adfuller
 
-@contextmanager
-def _suppress_fds():
-    import sys as _sys
-    import os as _os
-    _sys.stdout.flush(); _sys.stderr.flush()
-    devnull_fd = _os.open(_os.devnull, _os.O_RDWR)
-    try:
-        old_stdout = _os.dup(1)
-        old_stderr = _os.dup(2)
-        _os.dup2(devnull_fd, 1)
-        _os.dup2(devnull_fd, 2)
-        yield
-    finally:
-        try:
-            _sys.stdout.flush(); _sys.stderr.flush()
-        except Exception:
-            pass
-        _os.dup2(old_stdout, 1)
-        _os.dup2(old_stderr, 2)
-        _os.close(old_stdout)
-        _os.close(old_stderr)
-        _os.close(devnull_fd)
+def prepare_causality_data(prices_df: pd.DataFrame, adf_significance_level=0.05):
+    """
+    Prepares data for causality testing by ensuring stationarity through differencing.
+    """
+    logger = logging.getLogger(__name__)
+    numerical_df = prices_df.select_dtypes(include=np.number).copy()
+    stationary_df = pd.DataFrame(index=prices_df.index)
+
+    for col in numerical_df.columns:
+        series = numerical_df[col].dropna()
+        # Test for stationarity on the original series
+        adf_result = adfuller(series)
+        p_value = adf_result[1]
+
+        if p_value < adf_significance_level:
+            # Series is already stationary
+            stationary_df[col] = series
+            logger.debug("Series '%s' is stationary (p=%.4f). No differencing needed.", col, p_value)
+        else:
+            # Difference the series to make it stationary
+            diff_series = series.diff().dropna()
+            adf_result_diff = adfuller(diff_series)
+            p_value_diff = adf_result_diff[1]
+            stationary_df[col] = diff_series
+            if p_value_diff < adf_significance_level:
+                logger.debug("Series '%s' made stationary with 1st difference (p=%.4f).", col, p_value_diff)
+            else:
+                logger.warning("Series '%s' may not be stationary after 1st difference (p=%.4f).", col, p_value_diff)
+
+    # Drop columns that are all NaN after processing
+    stationary_df.dropna(axis=1, how='all', inplace=True)
+
+    # Scale the data
+    scaler = StandardScaler()
+    scaled_stationary_df = pd.DataFrame(scaler.fit_transform(stationary_df),
+                                        columns=stationary_df.columns,
+                                        index=stationary_df.index)
+    return scaled_stationary_df
 
 
-def prepare_causality_data(prices_df: pd.DataFrame, window: int = 12):
-    prices_df = prices_df.copy()
-    average_prices_df = prices_df.rolling(window=window).mean().dropna()
-    numerical_cols_average = average_prices_df.select_dtypes(include=np.number).columns.tolist()
-    numerical_df_for_causality_average = average_prices_df[numerical_cols_average]
-    numerical_df_diff_average = numerical_df_for_causality_average.diff().dropna()
-
-    scaler_average = StandardScaler()
-    numerical_df_diff_scaled_average = pd.DataFrame(scaler_average.fit_transform(numerical_df_diff_average),
-                                                    columns=numerical_df_diff_average.columns,
-                                                    index=numerical_df_diff_average.index)
-    return numerical_df_diff_scaled_average
-
-
-def run_granger_tests(numerical_df_diff_scaled_average: pd.DataFrame, max_lag: int = 10, alpha: float = 0.04):
+def run_granger_tests(stationary_df: pd.DataFrame, lags_to_test: list, alpha: float = 0.04):
+    logger = logging.getLogger(__name__)
     logging.getLogger('statsmodels').setLevel(logging.ERROR)
 
-    commodities_for_test = numerical_df_diff_scaled_average.columns
+    commodities_for_test = stationary_df.columns
     num_commodities_for_test = len(commodities_for_test)
 
     all_granger_test_results = []
     causality_adjacency_matrix_np = np.zeros((num_commodities_for_test, num_commodities_for_test))
+    max_lag = max(lags_to_test) if lags_to_test else 0
 
-    # Suppress high-level stdout/stderr and low-level FD writes
-    with open(os.devnull, 'w') as _devnull, contextlib.redirect_stdout(_devnull), contextlib.redirect_stderr(_devnull), _suppress_fds():
+    # Suppress stdout from grangercausalitytests
+    with open(os.devnull, 'w') as devnull, contextlib.redirect_stdout(devnull):
         for i in range(num_commodities_for_test):
             for j in range(num_commodities_for_test):
                 if i == j:
                     continue
                 source_commodity = commodities_for_test[i]
                 target_commodity = commodities_for_test[j]
-                data_pair = numerical_df_diff_scaled_average[[source_commodity, target_commodity]]
+                data_pair = stationary_df[[source_commodity, target_commodity]]
+                data_pair = data_pair.dropna()
 
                 try:
-                    test_results = grangercausalitytests(data_pair, maxlag=max_lag, verbose=False)
-                    for lag in range(1, max_lag + 1):
-                        if lag in test_results:
-                            p_value_ftest = test_results[lag][0]['ssr_ftest'][1]
-                            all_granger_test_results.append({
-                                'Source': source_commodity,
-                                'Target': target_commodity,
-                                'Lag': lag,
-                                'P-value (F-test)': p_value_ftest
-                            })
-                            if p_value_ftest < alpha:
-                                causality_adjacency_matrix_np[i, j] = 1
-                except Exception:
-                    pass
+                    # Check if there's enough data for the test
+                    if len(data_pair) <= max_lag:
+                        logger.debug("Skipping Granger test for (%s -> %s): insufficient data (%d) for max lag (%d)",
+                                     source_commodity, target_commodity, len(data_pair), max_lag)
+                        continue
+
+                    test_results = grangercausalitytests(data_pair, lags_to_test, verbose=False)
+
+                    for lag in lags_to_test:
+                        p_value_ftest = test_results[lag][0]['ssr_ftest'][1]
+                        all_granger_test_results.append({
+                            'Source': source_commodity,
+                            'Target': target_commodity,
+                            'Lag': lag,
+                            'P-value (F-test)': p_value_ftest
+                        })
+                        # Note: Adjacency matrix will now reflect significance at *any* tested lag
+                        if p_value_ftest < alpha:
+                            causality_adjacency_matrix_np[i, j] = 1
+                except Exception as e:
+                    logger.warning("Granger test failed for (%s -> %s): %s",
+                                   source_commodity, target_commodity, str(e))
 
     all_granger_test_results_df = pd.DataFrame(all_granger_test_results)
-    causality_adjacency_matrix_df = pd.DataFrame(causality_adjacency_matrix_np, index=commodities_for_test, columns=commodities_for_test)
-
-    return all_granger_test_results_df, causality_adjacency_matrix_df
+    # The adjacency matrix is not currently used in dss_analyst.py, so we only return the DataFrame.
+    return all_granger_test_results_df

@@ -1,9 +1,11 @@
+import os
 import numpy as np
 import pandas as pd
 from statsmodels.tsa.seasonal import seasonal_decompose
 from statsmodels.tsa.stattools import acf, pacf
 from scipy.fft import fft, fftfreq
 from scipy.signal import find_peaks
+from .file_utils import save_dataframe_to_gcs
 
 
 def _is_datetime_indexed(df):
@@ -14,7 +16,9 @@ def run_seasonality_analysis(prices_df,
                              cols_to_exclude=None,
                              num_top_periods_to_analyze=6,
                              min_peak_prominence_ratio=0.1,
-                             max_peaks_store=30):
+                             max_peaks_store=30,
+                             gcs_bucket_name=None,
+                             gcs_prefix=None):
     if cols_to_exclude is None:
         cols_to_exclude = ['date', 'day_of_week', 'month', 'year',
                            'day_of_week_sin', 'day_of_week_cos',
@@ -41,7 +45,8 @@ def run_seasonality_analysis(prices_df,
             'Analysis Status': 'Success',
             'Error Message': None,
             'FFT Peaks': [],
-            'Analyzed Periods': []
+            'Analyzed Periods': [],
+            'Decomposition File Path': None
         }
 
         try:
@@ -77,6 +82,9 @@ def run_seasonality_analysis(prices_df,
             seasonality_analysis_results[commodity] = commodity_results
             continue
 
+        # Store decomposition objects temporarily to find the best one later
+        decompositions_by_period = {}
+
         for period in periods_to_analyze_for_commodity:
             period_analysis_result = {
                 'Period': period,
@@ -92,7 +100,8 @@ def run_seasonality_analysis(prices_df,
                 'Is PACF Significant at Period': False
             }
 
-            min_length_for_stl = period + 2
+            # STL decomposition requires the series to be at least 2 * period long.
+            min_length_for_stl = 2 * period
             if len(commodity_series) < min_length_for_stl:
                 period_analysis_result['Period Analysis Status'] = 'Skipped (Insufficient Data for STL)'
                 period_analysis_result['Period Error Message'] = f'Insufficient data for STL decomposition (min length: {min_length_for_stl}).'
@@ -105,6 +114,12 @@ def run_seasonality_analysis(prices_df,
                 except TypeError:
                     stl = seasonal_decompose(commodity_series, model='additive', period=period)
 
+                # Store the decomposition components
+                decompositions_by_period[period] = {
+                    'trend': stl.trend,
+                    'seasonal': stl.seasonal,
+                    'resid': stl.resid
+                }
                 seasonal_component = stl.seasonal
                 residual_component = stl.resid
                 seasonality_plus_residual_std = np.nanstd(seasonal_component + residual_component)
@@ -133,14 +148,12 @@ def run_seasonality_analysis(prices_df,
                     period_lag_index = period
                     period_analysis_result['ACF at Period Lag'] = float(acf_values[period_lag_index])
                     period_analysis_result['PACF at Period Lag'] = float(pacf_values[period_lag_index])
-                    if conf_int_acf is not None and period_lag_index < len(conf_int_acf):
-                        lower_acf, upper_acf = conf_int_acf[period_lag_index]
-                        if period_analysis_result['ACF at Period Lag'] < lower_acf or period_analysis_result['ACF at Period Lag'] > upper_acf:
-                            period_analysis_result['Is ACF Significant at Period'] = True
-                    if conf_int_pacf is not None and period_lag_index < len(conf_int_pacf):
-                        lower_pacf, upper_pacf = conf_int_pacf[period_lag_index]
-                        if period_analysis_result['PACF at Period Lag'] < lower_pacf or period_analysis_result['PACF at Period Lag'] > upper_pacf:
-                            period_analysis_result['Is PACF Significant at Period'] = True
+                    # The confidence interval is centered at 0. A value is significant if it's outside the interval.
+                    # For a symmetric interval [-c, c], this is equivalent to |value| > c.
+                    if conf_int_acf is not None and period_lag_index < len(conf_int_acf) and abs(acf_values[period_lag_index]) > conf_int_acf[period_lag_index, 1]:
+                        period_analysis_result['Is ACF Significant at Period'] = True
+                    if conf_int_pacf is not None and period_lag_index < len(conf_int_pacf) and abs(pacf_values[period_lag_index]) > conf_int_pacf[period_lag_index, 1]:
+                        period_analysis_result['Is PACF Significant at Period'] = True
             except Exception as e:
                 period_analysis_result['Period Analysis Status'] = 'Failed (ACF/PACF)'
                 period_analysis_result['Period Error Message'] = f'ACF/PACF failed: {e}'
@@ -156,6 +169,35 @@ def run_seasonality_analysis(prices_df,
                 period_analysis_result['Period Error Message'] = 'FFT power lookup failed.'
 
             commodity_results['Analyzed Periods'].append(period_analysis_result)
+
+        # --- Save decomposition data for the best period ---
+        best_period_info = None
+        if commodity_results['Analyzed Periods']:
+            successful_periods = [p for p in commodity_results['Analyzed Periods'] if 'FFT Power at Period' in p and pd.notna(p['FFT Power at Period'])]
+            if successful_periods:
+                best_period_info = max(successful_periods, key=lambda x: x['FFT Power at Period'])
+
+        if best_period_info and gcs_bucket_name and gcs_prefix:
+            best_period = best_period_info['Period']
+            if best_period in decompositions_by_period:
+                try:
+                    decomposition_data = decompositions_by_period[best_period]
+                    decomposition_df = pd.DataFrame({
+                        'original': commodity_series,
+                        'trend': decomposition_data['trend'],
+                        'seasonal': decomposition_data['seasonal'],
+                        'residual': decomposition_data['resid']
+                    })
+                    decomposition_df.index.name = 'Date'
+
+                    file_name = f"decomposition_{commodity.replace(' ', '_')}_period{best_period}.csv"
+                    gcs_file_path = os.path.join(gcs_prefix, file_name)
+
+                    save_dataframe_to_gcs(df=decomposition_df, bucket_name=gcs_bucket_name, gcs_prefix=gcs_file_path, include_index=True)
+                    commodity_results['Decomposition File Path'] = f"gs://{gcs_bucket_name}/{gcs_file_path}"
+                except Exception as e:
+                    commodity_results['Error Message'] = (commodity_results['Error Message'] or "") + f" | Failed to save decomposition data: {e}"
+        # ----------------------------------------------------
 
         seasonal_periods_found = [p['Period'] for p in commodity_results['Analyzed Periods'] if p.get('Is Seasonal for Period')]
         significant_acf_periods = [p['Period'] for p in commodity_results['Analyzed Periods'] if p.get('Is ACF Significant at Period')]
@@ -189,7 +231,8 @@ def run_seasonality_analysis(prices_df,
             'Analysis Status': result.get('Analysis Status'),
             'Error Message': result.get('Error Message'),
             'Overall FFT Power': result.get('Overall FFT Power'),
-            'FFT Peaks': result.get('FFT Peaks', [])
+            'FFT Peaks': result.get('FFT Peaks', []),
+            'Decomposition File Path': result.get('Decomposition File Path')
         }
         if result.get('Analyzed Periods'):
             for period_result in result['Analyzed Periods']:

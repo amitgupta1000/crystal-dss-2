@@ -4,6 +4,7 @@ import numpy as np
 __all__ = [
 	"compute_correlations",
 	"build_filtered_correlation_matrix",
+	"compute_rolling_correlations",
 ]
 
 
@@ -53,6 +54,52 @@ def compute_correlations(prices_df: pd.DataFrame, window: int = 12, interpolate_
 		'pairwise_corr_df': pairwise_corr_df,
 		'diagnostics': diagnostics
 	}
+
+
+def compute_rolling_correlations(prices_df: pd.DataFrame, correlation_window: int, interpolate_method: str = 'time') -> pd.DataFrame:
+	"""
+	Computes rolling correlations over time to analyze correlation drift.
+
+	Args:
+		prices_df (pd.DataFrame): DataFrame with datetime index and commodity prices as columns.
+		correlation_window (int): The window size (number of periods) for the rolling correlation calculation.
+		interpolate_method (str): Method for interpolation.
+
+	Returns:
+		pd.DataFrame: A long-form DataFrame with columns ['Date', 'Commodity_A', 'Commodity_B', 'Correlation'].
+	"""
+	prices_df_numeric = prices_df.select_dtypes(include=np.number)
+
+	# Interpolate once to handle missing values
+	try:
+		prices_df_interpolated = prices_df_numeric.interpolate(method=interpolate_method)
+	except Exception:
+		prices_df_interpolated = prices_df_numeric
+
+	# Get the rolling window iterator
+	rolling_windows = prices_df_interpolated.rolling(window=correlation_window)
+
+	all_rolling_correlations = []
+
+	# Manually iterate through each window to compute correlations efficiently
+	for window_df in rolling_windows:
+		if len(window_df) < correlation_window:
+			continue
+
+		# Calculate correlation matrix for the current window
+		corr_matrix = window_df.corr()
+		
+		# Get the date for this window (the last date in the window)
+		window_date = window_df.index[-1]
+		
+		# Unstack to a long format, but only keep the upper triangle to avoid duplicates
+		corr_pairs = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)).stack().reset_index()
+		corr_pairs.columns = ['Commodity_A', 'Commodity_B', 'Correlation']
+		corr_pairs['Date'] = window_date
+		all_rolling_correlations.append(corr_pairs)
+
+	# Concatenate all results into a single DataFrame
+	return pd.concat(all_rolling_correlations, ignore_index=True) if all_rolling_correlations else pd.DataFrame()
 
 
 def build_filtered_correlation_matrix(pairwise_corr_df: pd.DataFrame, correlation_matrix: pd.DataFrame, target_commodities: list, other_commodities: list) -> pd.DataFrame:
