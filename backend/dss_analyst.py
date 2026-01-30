@@ -116,6 +116,62 @@ def main():
         gcs_prefix_granger_results = f'{stats_studies_prefix}/causality/all_granger_test_results.csv'
         save_dataframe_to_gcs(df=all_granger_test_results_df, bucket_name=bucket_name, gcs_prefix=gcs_prefix_granger_results, validate_rows=False)
         logger.info('Saved Granger results to GCS: %s', gcs_prefix_granger_results)
+        
+        # Build causality network graph and adjacency matrix
+        logger.info('Building causality adjacency matrix and network graph...')
+        try:
+            # Import graph building functions
+            import sys
+            import os
+            sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
+            from build_causality_graph import (
+                build_adjacency_matrix_from_results,
+                build_causality_network_graph,
+                save_causality_network_data,
+                create_interactive_html
+            )
+            
+            # Build adjacency matrix
+            causality_adjacency_matrix_df = build_adjacency_matrix_from_results(
+                all_granger_test_results_df, alpha=alpha
+            )
+            
+            if not causality_adjacency_matrix_df.empty:
+                # Save adjacency matrix
+                gcs_prefix_adjacency = f'{stats_studies_prefix}/causality/causality_adjacency_matrix.csv'
+                save_dataframe_to_gcs(
+                    df=causality_adjacency_matrix_df,
+                    bucket_name=bucket_name,
+                    gcs_prefix=gcs_prefix_adjacency,
+                    validate_rows=False,
+                    include_index=True
+                )
+                logger.info('Saved causality adjacency matrix to GCS: %s', gcs_prefix_adjacency)
+                
+                # Build network graph
+                network_graph = build_causality_network_graph(
+                    granger_results_df=all_granger_test_results_df,
+                    adjacency_matrix_df=causality_adjacency_matrix_df,
+                    alpha=alpha,
+                    min_connection_count=2
+                )
+                
+                # Save network graph JSON
+                gcs_prefix_network = f'{stats_studies_prefix}/causality/causality_network_graph.json'
+                save_causality_network_data(network_graph, bucket_name=bucket_name, gcs_prefix=gcs_prefix_network)
+                logger.info('Network graph summary: %d nodes, %d edges',
+                           len(network_graph['nodes']), len(network_graph['edges']))
+                
+                # Create interactive HTML visualization
+                html_output = 'causality_graph.html'
+                create_interactive_html(network_graph, output_file=html_output)
+                logger.info('Created interactive HTML visualization: %s', html_output)
+            else:
+                logger.warning('Empty adjacency matrix - no significant causality relationships found')
+                
+        except Exception as e:
+            logger.error('Failed to build causality graph: %s', str(e))
+            logger.info('You can manually run: python backend/build_causality_graph.py')
     else:
         logger.warning("'all_granger_test_results_df' not available or empty; skipping save")
 

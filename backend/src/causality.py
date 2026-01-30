@@ -3,6 +3,7 @@ import contextlib
 import pandas as pd
 import numpy as np
 import logging
+import json
 from sklearn.preprocessing import StandardScaler
 from statsmodels.tsa.stattools import grangercausalitytests, adfuller
 
@@ -75,7 +76,7 @@ def run_granger_tests(stationary_df: pd.DataFrame, lags_to_test: list, alpha: fl
                                      source_commodity, target_commodity, len(data_pair), max_lag)
                         continue
 
-                    test_results = grangercausalitytests(data_pair, lags_to_test, verbose=False)
+                    test_results = grangercausalitytests(data_pair, lags_to_test)
 
                     for lag in lags_to_test:
                         p_value_ftest = test_results[lag][0]['ssr_ftest'][1]
@@ -93,5 +94,4 @@ def run_granger_tests(stationary_df: pd.DataFrame, lags_to_test: list, alpha: fl
                                    source_commodity, target_commodity, str(e))
 
     all_granger_test_results_df = pd.DataFrame(all_granger_test_results)
-    # The adjacency matrix is not currently used in dss_analyst.py, so we only return the DataFrame.
     return all_granger_test_results_df
