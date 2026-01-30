@@ -96,8 +96,8 @@ def build_adjacency_matrix_from_results(
 def build_causality_network_graph(
     granger_results_df: pd.DataFrame,
     adjacency_matrix_df: pd.DataFrame,
-    alpha: float = 0.04,
-    min_connection_count: int = 1
+    alpha: float = 0.01,
+    min_connection_count: int = 8
 ):
     """
     Build a network graph from Granger causality results for visualization.
@@ -271,13 +271,16 @@ def visualize_network_graph(network_graph: dict, output_file: str = None, figsiz
     
     nx.draw_networkx_edges(
         G, pos,
-        edge_color='gray',
-        alpha=0.3,
+        edge_color='#555555',
+        alpha=0.6,
         arrows=True,
-        arrowsize=10,
-        width=1,
+        arrowsize=25,
+        arrowstyle='->',
+        width=2,
         ax=ax,
-        connectionstyle='arc3,rad=0.1'
+        connectionstyle='arc3,rad=0.1',
+        min_source_margin=15,
+        min_target_margin=15
     )
     
     nx.draw_networkx_labels(
@@ -398,10 +401,20 @@ def create_interactive_html(network_graph: dict, output_file: str = 'causality_g
             return {
                 from: edge.source,
                 to: edge.target,
-                arrows: 'to',
+                arrows: {
+                    to: {
+                        enabled: true,
+                        scaleFactor: 1.2,
+                        type: 'arrow'
+                    }
+                },
                 label: 'lag ' + edge.lag,
                 title: 'P-value: ' + edge.p_value.toFixed(4) + '\\nLag: ' + edge.lag,
-                color: { opacity: edge.weight }
+                color: { 
+                    color: '#848484',
+                    opacity: edge.weight * 0.8 + 0.2
+                },
+                width: 2
             };
         });
         
@@ -415,8 +428,19 @@ def create_interactive_html(network_graph: dict, output_file: str = 'causality_g
                 borderWidthSelected: 4
             },
             edges: {
+                arrows: {
+                    to: {
+                        enabled: true,
+                        scaleFactor: 1.2,
+                        type: 'arrow'
+                    }
+                },
                 font: { size: 10, align: 'middle' },
-                smooth: { type: 'cubicBezier', roundness: 0.3 }
+                smooth: { type: 'cubicBezier', roundness: 0.3 },
+                width: 2,
+                color: {
+                    inherit: false
+                }
             },
             physics: {
                 stabilization: { iterations: 200 },
