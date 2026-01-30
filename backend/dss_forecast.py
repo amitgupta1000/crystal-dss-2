@@ -17,6 +17,7 @@ from src.fbprophet import generate_and_save_prophet_forecast
 from src.fbprophet_covariates import generate_and_save_prophet_covariate_forecast
 from src.gru import generate_and_save_gru_forecast
 from src.kan import generate_and_save_kan_forecast
+from src.mamba import generate_and_save_mamba_forecast
 from src.file_utils import save_dataframe_to_gcs, download_latest_csv_from_gcs
 import logging
 
@@ -136,21 +137,22 @@ if __name__ == '__main__':
     print("  4. TimesFM")
     print("  5. GRU")
     print("  6. KAN")
-    print("  7. All of the above (sequential)")
-    selection_input = input("\nEnter selection (e.g., 1 or 1,3 or 7 for all): ").strip()
+    print("  7. MAMBA (Unified Multivariate)")
+    print("  8. All of the above (sequential)")
+    selection_input = input("\nEnter selection (e.g., 1 or 1,3,7 or 8 for all): ").strip()
 
     tokens = [token.strip() for token in selection_input.split(',') if token.strip()]
     selected_options = []
     for token in tokens:
-        if token == '7':
-            selected_options = ['1', '2', '3', '4', '5', '6']
+        if token == '8':
+            selected_options = ['1', '2', '3', '4', '5', '6', '7']
             break
-        if token in {'1', '2', '3', '4', '5', '6'} and token not in selected_options:
+        if token in {'1', '2', '3', '4', '5', '6', '7'} and token not in selected_options:
             selected_options.append(token)
     if not selected_options:
-        selected_options = ['1', '2', '3', '4', '5', '6']
+        selected_options = ['1', '2', '3', '4', '5', '6', '7']
 
-    run_all_selected = set(selected_options) == {'1', '2', '3', '4', '5', '6'}
+    run_all_selected = set(selected_options) == {'1', '2', '3', '4', '5', '6', '7'}
 
     print("\n" + "=" * 80)
     print("Generating Forecasts with Confidence Intervals")
@@ -343,12 +345,51 @@ if __name__ == '__main__':
                 }
             )
 
-    if run_all_selected:
-        additional_models = [
-            'MAMBA',
-        ]
-        for model_name in additional_models:
-            model_results.append(run_dummy_forecast(model_name, bucket_name))
+    if '7' in selected_options:
+        # Option 7: Unified MAMBA (multivariate)
+        try:
+            print("\n" + "=" * 80)
+            print("OPTION 7: UNIFIED MAMBA (MULTIVARIATE)")
+            print("=" * 80)
+            
+            mamba_gcs_prefix = "forecast_data/mamba_forecast.csv"
+            print(f"  → Running unified Mamba forecasting for {len(commodity_columns)} commodities...")
+            print(f"  → Learning cross-commodity dynamics from causality relationships")
+            
+            mamba_df, mamba_gcs_path = generate_and_save_mamba_forecast(
+                prices_df=prices_df,
+                commodity_columns=commodity_columns,
+                forecast_steps=forecast_steps,
+                gcs_prefix=mamba_gcs_prefix,
+                train_new_model=False,  # Auto: load if exists, train if not
+                sequence_length=21,
+                n_layers=4,
+                num_epochs=30,
+                batch_size=32,
+                learning_rate=0.001,
+                bucket_name=bucket_name,
+            )
+            
+            model_results.append(
+                {
+                    'model': 'MAMBA (Unified)',
+                    'gcs_prefix': mamba_gcs_path,
+                    'status': 'Completed',
+                    'rows': mamba_df.shape[0] if mamba_df is not None else 0,
+                    'columns': mamba_df.shape[1] if mamba_df is not None else 0,
+                }
+            )
+        except Exception as exc:
+            print(f"\n✗ MAMBA forecasting failed: {exc}")
+            import traceback
+            traceback.print_exc()
+            model_results.append(
+                {
+                    'model': 'MAMBA',
+                    'gcs_prefix': 'n/a',
+                    'status': f'Failed: {exc}',
+                }
+            )
 
     print("\n" + "=" * 80)
     print("MODEL EXECUTION SUMMARY")

@@ -29,14 +29,14 @@ creds, _ = default()
 storage_client = storage.Client(credentials=creds)
 BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "crystal-dss")
 
-# Hidden layer configuration for KAN: comma-separated env var, default 32,16
-_raw = os.getenv("KAN_HIDDEN_UNITS", "32,16")
+# Hidden layer configuration for KAN: comma-separated env var, default 16,8
+_raw = os.getenv("KAN_HIDDEN_UNITS", "16,8")
 try:
     KAN_HIDDEN_UNITS = tuple(int(x) for x in _raw.split(',') if x.strip())
     if not KAN_HIDDEN_UNITS:
-        KAN_HIDDEN_UNITS = (32, 16)
+        KAN_HIDDEN_UNITS = (16, 8)
 except Exception:
-    KAN_HIDDEN_UNITS = (32, 16)
+    KAN_HIDDEN_UNITS = (16, 8)
 
 # Check for pykan availability
 try:
@@ -103,10 +103,10 @@ def prepare_sequences(
 
 def diagnose_kan_fit(
     series: pd.Series,
-    sequence_length: int = 30,
-    num_epochs: int = 100,
-    batch_size: int = 64,
-    learning_rate: float = 0.00001,
+    sequence_length: int = 21,
+    num_epochs: int = 30,
+    batch_size: int = 32,
+    learning_rate: float = 0.001,
     hidden_units: Tuple[int, ...] = KAN_HIDDEN_UNITS,
     device: Optional[torch.device] = None,
 ):
@@ -228,9 +228,9 @@ def diagnose_kan_fit(
 def train_kan_model(
     X_tensor: torch.Tensor,
     y_tensor: torch.Tensor,
-    sequence_length: int = 30,
+    sequence_length: int = 21,
     num_epochs: int = 30,
-    batch_size: int = 64,
+    batch_size: int = 32,
     learning_rate: float = 0.001,
     patience: int = 5,
     hidden_units: Tuple[int, ...] = KAN_HIDDEN_UNITS,
@@ -300,10 +300,6 @@ def train_kan_model(
         model = _train_kan_manual(model, X_tensor, y_tensor, num_epochs, batch_size, learning_rate, patience, device)
 
     return model
-
-
-
-
 
 def _train_kan_manual(
     model: 'KAN',
@@ -514,7 +510,7 @@ def save_kan_model_to_gcs(
 def load_kan_model_from_gcs(
     commodity: str,
     *,
-    sequence_length: int = 30,
+    sequence_length: int = 21,
     prefix: str = 'models/kan/',
     bucket_name: str = BUCKET_NAME,
 ) -> Optional['KAN']:
@@ -628,10 +624,10 @@ def generate_and_save_kan_forecast(
     gcs_prefix: str,
     *,
     train_new_models: bool = False,
-    sequence_length: int = 30,
+    sequence_length: int = 21,
     num_epochs: int = 20,
     batch_size: int = 64,
-    learning_rate: float = 0.0001,
+    learning_rate: float = 0.001,
     conf_interval_05: bool = False,
     conf_interval_10: bool = False,
     bucket_name: str = BUCKET_NAME,

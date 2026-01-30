@@ -104,3 +104,5 @@ voyageai==0.3.4
 uuid_utils==0.13.0
 openpyxl==3.1.5
 pykan==0.2.8
+mambapy==1.2.0
+einops==0.8.2
