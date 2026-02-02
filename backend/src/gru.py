@@ -20,7 +20,7 @@ from google.cloud import storage
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
 
-from src.file_utils import save_dataframe_to_gcs
+from src.file_utils import save_dataframe_to_gcs, filter_and_fill_series
 
 warnings.filterwarnings("ignore")
 
@@ -444,6 +444,18 @@ def generate_and_save_gru_forecast(
     print(f"Using device: {device}")
     print(f"Sequence length: {sequence_length}")
     print(f"Forecast steps: {forecast_steps}")
+
+    # Filter commodity list: keep only series with >=1000 non-null values and fill gaps
+    keep_cols, filled_df, dropped = filter_and_fill_series(prices_df, commodity_columns, min_non_nulls=1000)
+    print(f"\nTotal commodities requested: {len(commodity_columns)}")
+    print(f"Keeping {len(keep_cols)} commodities with >=1000 non-null values")
+    if dropped:
+        print(f"Dropped {len(dropped)} commodities due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+    if not keep_cols:
+        raise RuntimeError("No commodities have >=1000 non-null values; aborting GRU forecasting")
+
+    # Use the filtered list and filled dataframe going forward
+    commodity_columns = keep_cols
     
     # Determine if we need to train models
     commodities_to_train = []
@@ -457,9 +469,10 @@ def generate_and_save_gru_forecast(
         print("\nChecking for existing models in GCS...")
         for commodity in commodity_columns:
             try:
-                series = prices_df[commodity].dropna()
-                if len(series) < sequence_length + 10:
-                    print(f"  [{commodity}] Skipping: Insufficient data")
+                # use filled series from shared helper
+                series = filled_df[commodity]
+                if len(series.dropna()) < sequence_length + 10:
+                    print(f"  [{commodity}] Skipping: Insufficient data after filling")
                     continue
                 
                 # Try to load existing model
@@ -492,7 +505,8 @@ def generate_and_save_gru_forecast(
         # Prepare arguments for parallel training
         train_args = []
         for commodity in commodities_to_train:
-            series = prices_df[commodity].dropna()
+            # use filled series from shared helper
+            series = filled_df[commodity]
             series_data = series.values  # Convert to numpy for serialization
             train_args.append((
                 commodity,
@@ -531,7 +545,8 @@ def generate_and_save_gru_forecast(
         print("\nGenerating forecasts for newly trained models...")
         for commodity in trained_models:
             try:
-                series = prices_df[commodity].dropna()
+                # use filled series from shared helper
+                series = filled_df[commodity]
                 last_sequence = series.values[-sequence_length:]
                 
                 forecast_values = forecast_with_gru(
@@ -556,7 +571,8 @@ def generate_and_save_gru_forecast(
        
         for commodity in commodities_to_load:
             try:
-                series = prices_df[commodity].dropna()
+                series = prices_df[commodity].copy()
+                series = series.bfill().ffill()
                 
                 # Load model
                 model = load_gru_model_from_gcs(
@@ -608,7 +624,7 @@ def generate_and_save_gru_forecast(
     print(f"  Shape: {forecast_df.shape}")
     print(f"  Commodities: {len(all_forecasts)}")
     print(f"  Date range: {forecast_dates[0]} to {forecast_dates[-1]}")
-    
+    print (forecast_df.tail(5))
     # Combine historical data with forecast
     print(f"\nCombining historical data with forecast...")
     historical_df = prices_df[list(all_forecasts.keys())].copy()

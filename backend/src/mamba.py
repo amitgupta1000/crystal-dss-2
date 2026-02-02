@@ -6,16 +6,15 @@ Based on the mambapy library:
 https://github.com/kyscg/MambaPy
 
 Key Implementation Details:
-- MULTIVARIATE: One model learns from all commodities together
-- Uses mambapy.mamba.Mamba with MambaConfig
-- Architecture: d_model = num_commodities (e.g., 55), n_layers=4
-- Model configuration:
   * d_model: Number of commodities (input features per timestep)
   * n_layers: Number of Mamba blocks stacked (default 4)
-- Learns cross-commodity dynamics and causality relationships
-- GCS model persistence at gs://crystal-dss/models/mamba/
-- Early stopping with patience=5
-- Default 30 epochs
+# Key Implementation Details:
+# - MULTIVARIATE: One model learns from all commodities together
+# - Uses mambapy.mamba.Mamba with MambaConfig
+# - Architecture: d_model = num_commodities (e.g., 55), n_layers default 4
+# - GCS model persistence at gs://crystal-dss/models/mamba/
+# - Early stopping with a configurable `patience`
+# - Default training epochs: 100
 
 Architecture Pattern (UNIFIED):
 1. Input: (batch, seq_len, num_commodities) - all commodities at each timestep
@@ -31,9 +30,7 @@ Advantages over univariate:
 
 import io
 import os
-import re
 import warnings
-from concurrent.futures import ProcessPoolExecutor, as_completed
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -46,7 +43,7 @@ from google.cloud import storage
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
 
-from src.file_utils import save_dataframe_to_gcs
+from src.file_utils import save_dataframe_to_gcs, filter_and_fill_series
 
 warnings.filterwarnings("ignore")
 
@@ -90,6 +87,10 @@ class MambaForecaster(nn.Module):
         
         # Final linear layer: predict all commodities
         self.fc = nn.Linear(num_commodities, num_commodities)
+        # Initialize final layer to encourage non-flat outputs
+        nn.init.xavier_uniform_(self.fc.weight)
+        if self.fc.bias is not None:
+            nn.init.zeros_(self.fc.bias)
     
     def forward(self, x):
         """
@@ -139,7 +140,7 @@ class TimeSeriesDatasetMamba(Dataset):
 def prepare_multivariate_sequences(
     prices_df: pd.DataFrame,
     commodity_columns: List[str],
-    sequence_length: int = 21,
+    sequence_length: int = 30,
 ) -> Tuple[torch.Tensor, torch.Tensor, Dict[str, MinMaxScaler]]:
     """
     Prepare multivariate sequences for unified Mamba training.
@@ -155,13 +156,17 @@ def prepare_multivariate_sequences(
         y_tensor: Target values (num_samples, num_commodities)
         scalers: Dict of fitted scalers per commodity for inverse transformation
     """
-    # Select only commodity columns and drop rows with any NaN
-    data = prices_df[commodity_columns].dropna()
-    
+    # Filter commodities with sufficient history and fill remaining gaps
     print(f"\n  Data transformation:")
     print(f"    Raw data shape: {prices_df.shape} (all columns including Date)")
-    print(f"    Commodity columns selected: {len(commodity_columns)}")
-    print(f"    After selecting commodities & dropping NaN: {data.shape}")
+    print(f"    Commodity columns requested: {len(commodity_columns)}")
+    keep_cols, data, dropped = filter_and_fill_series(prices_df, commodity_columns, min_non_nulls=1000)
+    print(f"    Keeping {len(keep_cols)} commodities with >=1000 non-null values")
+    if dropped:
+        print(f"    Dropped {len(dropped)} commodities due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+
+    if data.empty:
+        raise ValueError("No commodity series have >=1000 non-null values; cannot prepare sequences")
     
     if len(data) < sequence_length + 1:
         raise ValueError(
@@ -172,20 +177,14 @@ def prepare_multivariate_sequences(
     scalers = {}
     scaled_data = np.zeros_like(data.values, dtype=np.float32)
     
-    for i, commodity in enumerate(commodity_columns):
+    # Use `keep_cols` ordering for scalers
+    for i, commodity in enumerate(keep_cols):
         scaler = MinMaxScaler()
         scaled_data[:, i] = scaler.fit_transform(data[commodity].values.reshape(-1, 1)).flatten()
         scalers[commodity] = scaler
     
     # Create sequences: each sample contains all commodities at each timestep
-    # SLIDING WINDOW APPROACH:
-    # From timesteps [0, 1, 2, ..., N], we create:
-    #   Sample 0: X = [0:21],   y = [21]
-    #   Sample 1: X = [1:22],   y = [22]
-    #   Sample 2: X = [2:23],   y = [23]
-    #   ...
-    #   Sample (N-21): X = [(N-21):(N)], y = [N]
-    # Result: (N - sequence_length) samples, each with shape (sequence_length, num_commodities)
+    # Sliding window approach producing (N - sequence_length) samples
     
     sequences = []
     targets = []
@@ -207,8 +206,8 @@ def prepare_multivariate_sequences(
     print(f"    Final tensor shapes:")
     print(f"      X_tensor: {X_tensor.shape} = (samples, sequence_length, commodities)")
     print(f"      y_tensor: {y_tensor.shape} = (samples, commodities)")
-    print(f"\n  Example: To predict day 22, we use days [1-21] as input")
-    print(f"           Each input has all {len(commodity_columns)} commodity prices at each of the 21 days")
+    print(f"\n  Example: To predict day (sequence_length+1), we use the previous {sequence_length} timesteps as input")
+    print(f"           Each input has all {len(keep_cols)} commodity prices at each of the {sequence_length} days")
     
     return X_tensor, y_tensor, scalers
 
@@ -220,7 +219,7 @@ def train_unified_mamba_model(
     n_layers: int = 4,
     num_epochs: int = 100,
     batch_size: int = 32,
-    learning_rate: float = 0.001,
+    learning_rate: float = 0.0005,
     patience: int = 5,
     device: str = 'cpu',
 ) -> MambaForecaster:
@@ -294,6 +293,8 @@ def train_unified_mamba_model(
             
             loss = criterion(outputs, targets)
             loss.backward()
+            # Gradient clipping to stabilize training
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
             
             running_loss += loss.item()
@@ -312,7 +313,19 @@ def train_unified_mamba_model(
         
         # Print every epoch to see actual progress
         if (epoch + 1) % 1 == 0:
-            print(f"    Epoch [{epoch+1:3d}/{num_epochs}], Loss: {avg_loss:.6f} {improvement}")
+            # Diagnostic: inspect a small batch output variance to detect collapse
+            try:
+                sample_X, _ = next(iter(train_loader))
+                sample_X = sample_X.to(device_obj)
+                model.eval()
+                with torch.no_grad():
+                    sample_out = model(sample_X[: min(8, len(sample_X))]).cpu().numpy()
+                out_std = float(sample_out.std())
+                model.train()
+            except Exception:
+                out_std = float('nan')
+
+            print(f"    Epoch [{epoch+1:3d}/{num_epochs}], Loss: {avg_loss:.6f} {improvement} | out_std={out_std:.6f}")
         
         # Early stopping triggered
         if patience_counter >= patience:
@@ -393,7 +406,7 @@ def save_unified_mamba_model_to_gcs(
     *,
     num_commodities: int,
     n_layers: int = 4,
-    sequence_length: int = 21,
+    sequence_length: int = 30,
     prefix: str = 'models/mamba/',
     bucket_name: str = BUCKET_NAME,
 ) -> Optional[str]:
@@ -423,7 +436,7 @@ def load_unified_mamba_model_from_gcs(
     *,
     num_commodities: int,
     n_layers: int = 4,
-    sequence_length: int = 21,
+    sequence_length: int = 30,
     prefix: str = 'models/mamba/',
     bucket_name: str = BUCKET_NAME,
 ) -> Optional[MambaForecaster]:
@@ -481,11 +494,12 @@ def generate_and_save_mamba_forecast(
     gcs_prefix: str,
     *,
     train_new_model: bool = False,
-    sequence_length: int = 21,
+    sequence_length: int = 30,
     n_layers: int = 4,
     num_epochs: int = 100,
     batch_size: int = 32,
-    learning_rate: float = 0.0001,
+    learning_rate: float = 0.0005,
+    patience: int = 5,
     conf_interval_05: bool = False,
     conf_interval_10: bool = False,
     bucket_name: str = BUCKET_NAME,
@@ -505,8 +519,8 @@ def generate_and_save_mamba_forecast(
         num_epochs: Training epochs (default 30)
         batch_size: Training batch size
         learning_rate: Optimizer learning rate
-        conf_interval_05: Generate 5% confidence intervals (not implemented for Mamba)
-        conf_interval_10: Generate 10% confidence intervals (not implemented for Mamba)
+        conf_interval_05: Generate 5% (95%) prediction bands using training residuals
+        conf_interval_10: Generate 10% (90%) prediction bands using training residuals
         bucket_name: GCS bucket name
         
     Returns:
@@ -521,6 +535,14 @@ def generate_and_save_mamba_forecast(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     
+    # Filter and fill series consistently across forecasters
+    keep_cols, filled_df, dropped = filter_and_fill_series(prices_df, commodity_columns, min_non_nulls=1000)
+    if not keep_cols:
+        raise RuntimeError("No commodity series have >=1000 non-null values; aborting MAMBA forecasting")
+    if dropped:
+        print(f"  Dropped {len(dropped)} commodities due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+
+    commodity_columns = keep_cols
     num_commodities = len(commodity_columns)
     print(f"\n{'='*80}")
     print(f"UNIFIED MAMBA FORECASTING")
@@ -532,6 +554,8 @@ def generate_and_save_mamba_forecast(
     
     model = None
     scalers = None
+    X_tensor = None
+    y_tensor = None
     
     # Try to load existing model if not training new
     if not train_new_model:
@@ -550,7 +574,7 @@ def generate_and_save_mamba_forecast(
             # Still need to prepare scalers for forecasting
             print("  Preparing scalers for loaded model...")
             try:
-                _, _, scalers = prepare_multivariate_sequences(
+                X_tensor, y_tensor, scalers = prepare_multivariate_sequences(
                     prices_df, commodity_columns, sequence_length
                 )
                 print("  ✓ Scalers prepared")
@@ -568,7 +592,7 @@ def generate_and_save_mamba_forecast(
             # Prepare multivariate sequences
             print("  Preparing multivariate sequences...")
             X_tensor, y_tensor, scalers = prepare_multivariate_sequences(
-                prices_df, commodity_columns, sequence_length
+                filled_df, commodity_columns, sequence_length
             )
             print(f"  ✓ Prepared {len(X_tensor)} sequences")
             print(f"  ✓ Input shape: {X_tensor.shape}")
@@ -584,7 +608,7 @@ def generate_and_save_mamba_forecast(
                 num_epochs=num_epochs,
                 batch_size=batch_size,
                 learning_rate=learning_rate,
-                patience=5,
+                patience=patience,
                 device=str(device),
             )
             
@@ -613,8 +637,8 @@ def generate_and_save_mamba_forecast(
     print("="*80)
     
     try:
-        # Get last sequence_length rows for all commodities
-        last_data = prices_df[commodity_columns].dropna().tail(sequence_length)
+        # Get last sequence_length rows for all commodities from the filled dataframe
+        last_data = filled_df[commodity_columns].tail(sequence_length)
         last_sequences = last_data.values  # Shape: (sequence_length, num_commodities)
         
         print(f"  Using last {len(last_sequences)} timesteps from historical data")
@@ -652,15 +676,67 @@ def generate_and_save_mamba_forecast(
     # Build forecast dataframe
     forecast_df = pd.DataFrame(all_forecasts, index=forecast_dates)
     forecast_df.index.name = 'Date'
+
+    # Compute confidence intervals using training residuals (one-step-ahead)
+    lower_05 = {}
+    upper_05 = {}
+    lower_10 = {}
+    upper_10 = {}
+
+    if (conf_interval_05 or conf_interval_10) and (X_tensor is not None and y_tensor is not None):
+        try:
+            model.eval()
+            with torch.no_grad():
+                preds_scaled = model(X_tensor.to(device)).cpu().numpy()
+
+            # Inverse transform preds and targets to original scale
+            preds_orig = np.zeros_like(preds_scaled)
+            targets_orig = np.zeros_like(preds_scaled)
+            for i, commodity in enumerate(commodity_columns):
+                scaler = scalers[commodity]
+                preds_orig[:, i] = scaler.inverse_transform(preds_scaled[:, i].reshape(-1, 1)).flatten()
+                targets_orig[:, i] = scaler.inverse_transform(y_tensor.numpy()[:, i].reshape(-1, 1)).flatten()
+
+            residuals = targets_orig - preds_orig  # shape: (num_samples, num_commodities)
+
+            for i, commodity in enumerate(commodity_columns):
+                res = residuals[:, i]
+                if conf_interval_05:
+                    lower_95 = np.percentile(res, 2.5)
+                    upper_95 = np.percentile(res, 97.5)
+                    lower_05[commodity] = lower_95
+                    upper_05[commodity] = upper_95
+                if conf_interval_10:
+                    lower_90 = np.percentile(res, 5.0)
+                    upper_90 = np.percentile(res, 95.0)
+                    lower_10[commodity] = lower_90
+                    upper_10[commodity] = upper_90
+        except Exception as exc:
+            print(f"  ✗ Failed to compute confidence intervals from residuals: {exc}")
+    else:
+        if conf_interval_05 or conf_interval_10:
+            print("  ⚠ Not enough data to compute confidence intervals (skipping intervals)")
+
+    # Attach bands to forecast_df
+    if conf_interval_05:
+        for commodity in commodity_columns:
+            if commodity in lower_05:
+                forecast_df[f"{commodity}_lower_05"] = forecast_df[commodity] + lower_05[commodity]
+                forecast_df[f"{commodity}_upper_05"] = forecast_df[commodity] + upper_05[commodity]
+    if conf_interval_10:
+        for commodity in commodity_columns:
+            if commodity in lower_10:
+                forecast_df[f"{commodity}_lower_10"] = forecast_df[commodity] + lower_10[commodity]
+                forecast_df[f"{commodity}_upper_10"] = forecast_df[commodity] + upper_10[commodity]
     
     print(f"\n✓ Forecast dataframe created")
     print(f"  Shape: {forecast_df.shape}")
     print(f"  Commodities: {len(all_forecasts)}")
     print(f"  Date range: {forecast_dates[0]} to {forecast_dates[-1]}")
-    
+    print (forecast_df.tail(5))
     # Combine historical and forecast
     print(f"\nCombining historical data with forecast...")
-    historical_df = prices_df[commodity_columns].copy()
+    historical_df = filled_df[commodity_columns].copy()
     combined_df = pd.concat([historical_df, forecast_df], axis=0, join='outer')
     combined_df.sort_index(inplace=True)
     combined_df.index.name = 'Date'
@@ -673,6 +749,13 @@ def generate_and_save_mamba_forecast(
     # Save to GCS
     print(f"\nSaving combined historical + forecast to GCS: {gcs_prefix}")
     combined_df_to_save = combined_df.reset_index()
+    # Diagnostics: print tail and basic errors for forecasts
+    try:
+        from src.file_utils import inspect_forecast_df
+        inspect_forecast_df(combined_df_to_save, forecast_dates[0], name="MAMBA", tail_n=10)
+    except Exception:
+        pass
+
     gcs_path = save_dataframe_to_gcs(
         df=combined_df_to_save,
         bucket_name=bucket_name,

@@ -6,6 +6,7 @@ import os
 from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import pandas as pd
+import numpy as np
 
 try:
     from timesfm import TimesFm, TimesFmCheckpoint, TimesFmHparams
@@ -14,7 +15,7 @@ except ImportError as exc:  # pragma: no cover - clearer guidance for operators
         "timesfm package is required; install with `pip install timesfm`."
     ) from exc
 
-from .file_utils import save_dataframe_to_gcs
+from .file_utils import save_dataframe_to_gcs, filter_and_fill_series
 
 _DEFAULT_BUCKET = os.getenv("GCS_BUCKET_NAME", "crystal-dss")
 _TIMESFM_REPO = os.getenv("TIMESFM_REPO_ID", "google/timesfm-2.0-500m-pytorch")
@@ -177,7 +178,14 @@ def generate_and_save_timesfm_forecast(
 
     bucket = bucket_name or _DEFAULT_BUCKET
 
-    history_df = prices_df[commodity_list].copy()
+    # Filter commodities and fill missing values
+    keep_cols, filled_df, dropped = filter_and_fill_series(prices_df, commodity_list, min_non_nulls=1000)
+    if not keep_cols:
+        raise ValueError("No commodity series have >=1000 non-null values; cannot generate TimesFM forecast")
+    if dropped:
+        print(f"TimesFM: Dropped {len(dropped)} commodities due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+
+    history_df = filled_df[keep_cols].copy()
     history_df.sort_index(inplace=True)
     if history_df.index.has_duplicates:
         history_df = history_df.loc[~history_df.index.duplicated(keep="last")]
@@ -218,7 +226,8 @@ def generate_and_save_timesfm_forecast(
 
     forecast_df = forecast_df.copy()
     forecast_df["ds"] = pd.to_datetime(forecast_df["ds"], utc=False).dt.tz_localize(None)
-
+    print (forecast_df.tail(5))
+    
     quantile_map = _quantile_column_map(forecast_df.columns)
     if not quantile_map:
         if quantiles and not quantiles_supported:
@@ -240,6 +249,39 @@ def generate_and_save_timesfm_forecast(
         for commodity in point_wide.columns:
             series = point_wide[commodity].iloc[:forecast_steps]
             combined_frames[commodity] = series.rename(commodity)
+
+    # Fallback: if requested confidence intervals are enabled but TimesFM did
+    # not provide quantiles, estimate bands from historical one-step changes.
+    if quantile_map == {}:
+        if conf_interval_05 and (lower_05_wide.empty or upper_05_wide.empty):
+            for commodity in point_wide.columns:
+                try:
+                    diffs = history_df[commodity].diff().dropna().values
+                    if diffs.size == 0:
+                        continue
+                    l95 = np.percentile(diffs, 2.5)
+                    u95 = np.percentile(diffs, 97.5)
+                    lower_series = point_wide[commodity].iloc[:forecast_steps] + l95
+                    upper_series = point_wide[commodity].iloc[:forecast_steps] + u95
+                    combined_frames[f"{commodity}_lower_05"] = lower_series.rename(f"{commodity}_lower_05")
+                    combined_frames[f"{commodity}_upper_05"] = upper_series.rename(f"{commodity}_upper_05")
+                except Exception:
+                    continue
+
+        if conf_interval_10 and (lower_10_wide.empty or upper_10_wide.empty):
+            for commodity in point_wide.columns:
+                try:
+                    diffs = history_df[commodity].diff().dropna().values
+                    if diffs.size == 0:
+                        continue
+                    l90 = np.percentile(diffs, 5.0)
+                    u90 = np.percentile(diffs, 95.0)
+                    lower_series = point_wide[commodity].iloc[:forecast_steps] + l90
+                    upper_series = point_wide[commodity].iloc[:forecast_steps] + u90
+                    combined_frames[f"{commodity}_lower_10"] = lower_series.rename(f"{commodity}_lower_10")
+                    combined_frames[f"{commodity}_upper_10"] = upper_series.rename(f"{commodity}_upper_10")
+                except Exception:
+                    continue
 
     if conf_interval_05 and not lower_05_wide.empty and not upper_05_wide.empty:
         for commodity in lower_05_wide.columns:

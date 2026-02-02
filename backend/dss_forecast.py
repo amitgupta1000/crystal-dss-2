@@ -1,4 +1,3 @@
-
 import os
 import re
 from dotenv import load_dotenv
@@ -60,38 +59,25 @@ bucket_name = 'crystal-dss'
 
 load_dotenv()
 
-# Number of KAN training epochs can be controlled via environment variable KAN_EPOCHS
-try:
-    kan_num_epochs = int(os.getenv("KAN_EPOCHS", "20"))
-except Exception:
-    kan_num_epochs = 20
 
-def run_dummy_forecast(model_name, bucket_name):
-    print("\n" + "=" * 80)
-    print(f"{model_name.upper()} FORECAST PLACEHOLDER")
-    print("=" * 80)
-    print(f"Skipping {model_name} forecast. Placeholder artifact will be written to GCS.")
-    slug = re.sub(r"[^0-9A-Za-z]+", "_", model_name.strip()).strip("_").lower() or "model"
-    gcs_prefix = f"forecast_data/{slug}_forecast_placeholder.csv"
-    placeholder_df = pd.DataFrame([
-        {
-            'Model': model_name,
-            'Status': 'Not Implemented',
-        }
-    ])
-    save_dataframe_to_gcs(
-        df=placeholder_df,
-        bucket_name=bucket_name,
-        gcs_prefix=gcs_prefix,
-        validate_rows=False,
-    )
-    print(f"  ✓ Placeholder saved to GCS prefix: {gcs_prefix}")
-    return {
-        'model': model_name,
-        'gcs_prefix': gcs_prefix,
-        'status': 'Placeholder saved',
-    }
+# Centralized MAMBA configuration (overrides defaults in src/mamba.py)
+MAMBA_CONFIG = {
+    "sequence_length": int(os.getenv("MAMBA_SEQ_LEN", "25")),
+    "n_layers": int(os.getenv("MAMBA_N_LAYERS", "4")),
+    "num_epochs": int(os.getenv("MAMBA_EPOCHS", "30")),
+    "batch_size": int(os.getenv("MAMBA_BATCH_SIZE", "32")),
+    "learning_rate": float(os.getenv("MAMBA_LR", "0.001")),
+    "patience": int(os.getenv("MAMBA_PATIENCE", "5")),
+}
 
+# Centralized KAN configuration
+KAN_CONFIG = {
+    "sequence_length": int(os.getenv("KAN_SEQ_LEN", "21")),
+    "num_epochs": int(os.getenv("KAN_EPOCHS", "20")),
+    "batch_size": int(os.getenv("KAN_BATCH_SIZE", "32")),
+    "learning_rate": float(os.getenv("KAN_LR", "0.001")),
+    "hidden_units": tuple(int(x) for x in os.getenv("KAN_HIDDEN", "16, 8").split(",") if x.strip()),
+}
 
 if __name__ == '__main__':
     print("\n" + "="*80)
@@ -322,12 +308,8 @@ if __name__ == '__main__':
                 forecast_steps=forecast_steps,
                 gcs_prefix='forecast_data/kan_multivariate_forecast.csv',
                 train_new_model=False,  # Auto: load if exists, train if not
-                sequence_length=21,
-                num_epochs=30,
-                batch_size=32,
-                learning_rate=0.001,
-                hidden_units=(32, 16),
                 bucket_name=bucket_name,
+                **KAN_CONFIG,
             )
             model_results.append(
                 {
@@ -364,12 +346,10 @@ if __name__ == '__main__':
                 forecast_steps=forecast_steps,
                 gcs_prefix=mamba_gcs_prefix,
                 train_new_model=False,  # Auto: load if exists, train if not
-                sequence_length=21,
-                n_layers=4,
-                num_epochs=30,
-                batch_size=32,
-                learning_rate=0.001,
                 bucket_name=bucket_name,
+                conf_interval_05=True,
+                conf_interval_10=True,
+                **MAMBA_CONFIG,
             )
             
             model_results.append(

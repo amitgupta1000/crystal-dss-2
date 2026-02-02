@@ -107,11 +107,14 @@ def save_dataframe_to_gcs(df: pd.DataFrame, bucket_name: str, gcs_prefix: str, v
     try:
         blob = bucket.blob(gcs_prefix)
         blob.upload_from_string(csv_buffer.getvalue(), content_type='text/csv')
-        print(f"DataFrame successfully saved to gs://{bucket_name}/{gcs_prefix}")
+        gs_path = f"gs://{bucket_name}/{gcs_prefix}"
+        print(f"DataFrame successfully saved to {gs_path}")
+        return gs_path
     except exceptions.Forbidden:
         print(f"Error: Permission denied when uploading to gs://{bucket_name}/{gcs_prefix}. Please check your GCP permissions.")
     except Exception as e:
         print(f"An unexpected error occurred while uploading to GCS: {e}")
+    return None
 
 
 def download_latest_csv_from_gcs(bucket_name: str = 'crystal-dss', gcs_prefix: str = 'cleaned_data') -> pd.DataFrame:
@@ -148,3 +151,33 @@ def download_latest_csv_from_gcs(bucket_name: str = 'crystal-dss', gcs_prefix: s
             raise RuntimeError(f"Failed to parse CSV from '{latest_blob.name}': {e}")
 
     return df
+
+
+def filter_and_fill_series(
+    prices_df: pd.DataFrame,
+    commodity_columns: list,
+    *,
+    min_non_nulls: int = 1000,
+) -> tuple[list, pd.DataFrame, list]:
+    """Select commodity series with at least `min_non_nulls` non-null values and
+    fill remaining gaps via backfill then forward-fill.
+
+    Returns:
+        keep_cols: list of columns kept
+        df_filled: DataFrame with kept columns and NaNs filled
+        dropped: list of columns dropped due to insufficient data
+    """
+    counts = prices_df[commodity_columns].notna().sum()
+    keep_cols = [c for c in commodity_columns if counts.get(c, 0) >= min_non_nulls]
+    dropped = [c for c in commodity_columns if c not in keep_cols]
+
+    if not keep_cols:
+        return [], pd.DataFrame(), dropped
+
+    df = prices_df[keep_cols].copy()
+    pre_nans = int(df.isna().sum().sum())
+    if pre_nans > 0:
+        # backfill then forward-fill to preserve most recent history
+        df = df.bfill().ffill()
+
+    return keep_cols, df, dropped

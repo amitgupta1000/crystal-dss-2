@@ -8,7 +8,7 @@ from typing import Dict, Iterable, Optional, Tuple
 import pandas as pd
 from prophet import Prophet
 
-from .file_utils import save_dataframe_to_gcs
+from .file_utils import save_dataframe_to_gcs, filter_and_fill_series
 
 _DEFAULT_BUCKET = os.getenv("GCS_BUCKET_NAME", "crystal-dss")
 _CONF_RATIO_90_TO_95 = 1.645 / 1.96
@@ -144,7 +144,14 @@ def generate_and_save_prophet_forecast(
 
     bucket = bucket_name or _DEFAULT_BUCKET
 
-    historical_df = prices_df[list(commodity_columns)].copy()
+    # Filter and fill series consistently across forecasters
+    keep_cols, filled_df, dropped = filter_and_fill_series(prices_df, list(commodity_columns), min_non_nulls=1000)
+    if not keep_cols:
+        raise ValueError("No commodity series have >=1000 non-null values; cannot run Prophet forecasting")
+    if dropped:
+        print(f"Prophet: Dropped {len(dropped)} commodities due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+
+    historical_df = filled_df[keep_cols].copy()
     forecast_series: Dict[str, pd.Series] = {}
     lower_05_series: Dict[str, pd.Series] = {}
     upper_05_series: Dict[str, pd.Series] = {}
@@ -152,10 +159,10 @@ def generate_and_save_prophet_forecast(
     upper_10_series: Dict[str, pd.Series] = {}
     run_summaries = []
 
-    for commodity in commodity_columns:
-        series = prices_df[commodity].dropna()
+    for commodity in keep_cols:
+        series = filled_df[commodity]
         if series.empty:
-            run_summaries.append({"Commodity": commodity, "Status": "Skipped", "Reason": "Empty series"})
+            run_summaries.append({"Commodity": commodity, "Status": "Skipped", "Reason": "Empty series after filling"})
             continue
 
         try:
@@ -194,7 +201,7 @@ def generate_and_save_prophet_forecast(
         forecast_wide_df = pd.DataFrame(combined_forecast_frames)
     else:
         forecast_wide_df = pd.DataFrame(columns=historical_df.columns)
-
+    print (forecast_wide_df.tail(5))
     combined_df = pd.concat([historical_df, forecast_wide_df], axis=0, join="outer")
     combined_df.sort_index(inplace=True)
     combined_df.index.name = "Date"

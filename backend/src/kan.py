@@ -833,7 +833,7 @@ def generate_and_save_kan_forecast(
     print(f"  Shape: {forecast_df.shape}")
     print(f"  Commodities: {len(all_forecasts)}")
     print(f"  Date range: {forecast_dates[0]} to {forecast_dates[-1]}")
-    
+    print (forecast_df.tail(5))
     # Combine historical data with forecast
     print(f"\nCombining historical data with forecast...")
     historical_df = prices_df[list(all_forecasts.keys())].copy()

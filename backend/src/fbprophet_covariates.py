@@ -10,7 +10,7 @@ from prophet import Prophet
 
 from .fbprophet import _DEFAULT_BUCKET
 from .fbprophet import _infer_frequency, _prepare_prophet_frame, _scale_intervals_to_90
-from .file_utils import save_dataframe_to_gcs
+from .file_utils import save_dataframe_to_gcs, filter_and_fill_series
 
 _DEFAULT_BUCKET = os.getenv("GCS_BUCKET_NAME", "crystal-dss")
 
@@ -271,6 +271,17 @@ def generate_and_save_prophet_covariate_forecast(
 
     numeric_columns = _filter_numeric_columns(working_prices_df, list(working_prices_df.columns))
 
+    # Apply shared completeness filter and filling across prophet covariate flow
+    keep_cols, filled_df, dropped = filter_and_fill_series(working_prices_df, numeric_columns, min_non_nulls=1000)
+    if not keep_cols:
+        raise ValueError("No numeric commodity series have >=1000 non-null values; cannot run Prophet covariate forecasting")
+    if dropped:
+        print(f"Prophet covariates: Dropped {len(dropped)} series due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+
+    # Use the filled dataframe and restricted column set
+    working_prices_df = filled_df[keep_cols].copy()
+    numeric_columns = [c for c in numeric_columns if c in keep_cols]
+
     target_list = list(target_commodities) if target_commodities is not None else numeric_columns
     valid_targets = _filter_numeric_columns(working_prices_df, target_list)
 
@@ -337,7 +348,9 @@ def generate_and_save_prophet_covariate_forecast(
     combined_frames.update(lower_10)
     combined_frames.update(upper_10)
     forecast_wide = pd.DataFrame(combined_frames) if combined_frames else pd.DataFrame(columns=historical_df.columns)
+    print(forecast_wide.tail(5))
     if not forecast_wide.empty:
+
         future_index = pd.to_datetime(forecast_wide.index)
         if getattr(future_index, "tz", None) is not None:
             future_index = future_index.tz_localize(None)

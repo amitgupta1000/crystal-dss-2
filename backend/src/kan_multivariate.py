@@ -19,7 +19,7 @@ from google.cloud import storage
 from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, TensorDataset
 
-from src.file_utils import save_dataframe_to_gcs
+from src.file_utils import save_dataframe_to_gcs, filter_and_fill_series
 
 warnings.filterwarnings("ignore")
 
@@ -110,9 +110,22 @@ def prepare_multivariate_sequences(
     print(f"\nPreparing multivariate sequences...")
     print(f"  Raw data shape: {prices_df.shape}")
     
-    # Select commodity columns and drop NaN
-    data = prices_df[commodity_columns].dropna()
-    print(f"  After selecting {len(commodity_columns)} commodities & dropping NaN: {data.shape}")
+    # Select commodity columns and keep only series with sufficient history
+    counts = prices_df[commodity_columns].notna().sum()
+    keep_cols = [c for c in commodity_columns if counts.get(c, 0) >= 1000]
+    dropped = [c for c in commodity_columns if c not in keep_cols]
+    print(f"  Commodity columns selected: {len(commodity_columns)}")
+    print(f"  Keeping {len(keep_cols)} series with >=1000 non-null values")
+    if dropped:
+        print(f"  Dropped {len(dropped)} series due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+
+    if not keep_cols:
+        raise ValueError("No commodity series have >=1000 non-null values; cannot prepare sequences")
+
+    # Work on a copy and fill remaining gaps via backfill then forward-fill
+    # (use shared helper to ensure consistent behavior)
+    _, data, _ = filter_and_fill_series(prices_df, keep_cols, min_non_nulls=1000)
+    print(f"  After filling: {data.shape}")
     
     if len(data) < sequence_length + 1:
         raise ValueError(
@@ -123,7 +136,7 @@ def prepare_multivariate_sequences(
     scalers = []
     scaled_data = np.zeros_like(data.values, dtype=np.float32)
     
-    for i, col in enumerate(commodity_columns):
+    for i, col in enumerate(keep_cols):
         scaler = MinMaxScaler()
         scaled_data[:, i] = scaler.fit_transform(data[col].values.reshape(-1, 1)).flatten()
         scalers.append(scaler)
@@ -151,7 +164,7 @@ def prepare_multivariate_sequences(
     print(f"      X_tensor: {X_tensor.shape} = (samples, sequence_length, commodities)")
     print(f"      y_tensor: {y_tensor.shape} = (samples, commodities)")
     print(f"\n  Example: To predict day {sequence_length + 1}, we use days [1-{sequence_length}] as input")
-    print(f"           Each input has all {len(commodity_columns)} commodity prices at each of the {sequence_length} days")
+    print(f"           Each input has all {len(keep_cols)} commodity prices at each of the {sequence_length} days")
     
     return X_tensor, y_tensor, scalers
 
@@ -412,9 +425,27 @@ def load_unified_kan_model_from_gcs(
         buffer = io.BytesIO()
         blob.download_to_file(buffer)
         buffer.seek(0)
-        
-        # Load state dict
-        state_dict = torch.load(buffer, map_location='cpu')
+
+        # Load state dict. Newer PyTorch versions (>=2.6) restrict globals during
+        # unpickling; allowlist `MinMaxScaler` from sklearn for trusted checkpoints.
+        try:
+            ser = getattr(torch, 'serialization', None)
+            if ser is not None and hasattr(ser, 'safe_globals'):
+                with ser.safe_globals([MinMaxScaler]):
+                    state_dict = torch.load(buffer, map_location='cpu')
+            elif ser is not None and hasattr(ser, 'add_safe_globals'):
+                # older API: add_safe_globals(regs)
+                ser.add_safe_globals([MinMaxScaler])
+                state_dict = torch.load(buffer, map_location='cpu')
+            else:
+                state_dict = torch.load(buffer, map_location='cpu')
+        except Exception as ex:
+            # Try fallback: some versions accept weights_only=False to allow full deserialization.
+            try:
+                buffer.seek(0)
+                state_dict = torch.load(buffer, map_location='cpu', weights_only=False)
+            except Exception as ex2:
+                raise
         
         # Reconstruct model
         model = MultivariateLegacyKANForecaster(
@@ -483,6 +514,13 @@ def generate_and_save_kan_multivariate_forecast(
     
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
+    # Filter and fill series consistently
+    keep_cols, filled_df, dropped = filter_and_fill_series(prices_df, commodity_columns, min_non_nulls=1000)
+    if not keep_cols:
+        raise RuntimeError("No commodity series have >=1000 non-null values; aborting KAN forecasting")
+    if dropped:
+        print(f"  Dropped {len(dropped)} series due to insufficient data: {dropped[:10]}{'...' if len(dropped)>10 else ''}")
+    commodity_columns = keep_cols
     print(f"Commodities: {len(commodity_columns)}")
     print(f"Sequence length: {sequence_length}")
     print(f"Hidden units: {hidden_units}")
@@ -512,9 +550,9 @@ def generate_and_save_kan_multivariate_forecast(
     if model is None:
         print("\nTraining new unified KAN model...")
         
-        # Prepare multivariate sequences
+        # Prepare multivariate sequences (use filled dataframe)
         X_tensor, y_tensor, scalers = prepare_multivariate_sequences(
-            prices_df,
+            filled_df,
             commodity_columns,
             sequence_length=sequence_length,
         )
@@ -549,8 +587,8 @@ def generate_and_save_kan_multivariate_forecast(
     model = model.to(device)
     model.eval()
     
-    # Prepare last sequence for forecasting
-    data = prices_df[commodity_columns].dropna()
+    # Prepare last sequence for forecasting from filled dataframe
+    data = filled_df[commodity_columns]
     last_sequence_original = data.iloc[-sequence_length:].values  # (sequence_length, num_commodities)
     
     # Scale using trained scalers
@@ -585,9 +623,68 @@ def generate_and_save_kan_multivariate_forecast(
     print(f"\n  Generated forecasts:")
     print(f"    Shape: {forecast_df.shape}")
     print(f"    Date range: {forecast_dates[0]} to {forecast_dates[-1]}")
-    
+    print (forecast_df.tail(5))
     # Save to GCS
     print(f"\nSaving forecast to GCS...")
+    # Compute confidence intervals from training residuals if requested
+    try:
+        from src.file_utils import inspect_forecast_df
+        inspect_forecast_df(combined_df_to_save, forecast_dates[0], name="KAN", tail_n=10)
+    except Exception:
+        pass
+
+    # Residual-based intervals: prepare training sequences if possible
+    try:
+        X_tensor, y_tensor, scalers = prepare_multivariate_sequences(
+            prices_df, commodity_columns, sequence_length=sequence_length
+        )
+        # Compute model one-step predictions on training set
+        try:
+            model.eval()
+            with torch.no_grad():
+                preds_scaled = model(X_tensor.to(device)).cpu().numpy()
+
+            preds_orig = np.zeros_like(preds_scaled)
+            targets_orig = np.zeros_like(preds_scaled)
+            for i, scaler in enumerate(scalers):
+                preds_orig[:, i] = scaler.inverse_transform(preds_scaled[:, i].reshape(-1, 1)).flatten()
+                targets_orig[:, i] = scaler.inverse_transform(y_tensor.numpy()[:, i].reshape(-1, 1)).flatten()
+
+            residuals = targets_orig - preds_orig
+
+            lower_05 = {}
+            upper_05 = {}
+            lower_10 = {}
+            upper_10 = {}
+
+            for i, col in enumerate(commodity_columns):
+                res = residuals[:, i]
+                lower_95 = np.percentile(res, 2.5)
+                upper_95 = np.percentile(res, 97.5)
+                lower_05[col] = lower_95
+                upper_05[col] = upper_95
+                lower_90 = np.percentile(res, 5.0)
+                upper_90 = np.percentile(res, 95.0)
+                lower_10[col] = lower_90
+                upper_10[col] = upper_90
+
+            # Attach bands to forecast_df
+            if lower_05 and upper_05:
+                for col in commodity_columns:
+                    forecast_df[f"{col}_lower_05"] = forecast_df[col] + lower_05[col]
+                    forecast_df[f"{col}_upper_05"] = forecast_df[col] + upper_05[col]
+            if lower_10 and upper_10:
+                for col in commodity_columns:
+                    forecast_df[f"{col}_lower_10"] = forecast_df[col] + lower_10[col]
+                    forecast_df[f"{col}_upper_10"] = forecast_df[col] + upper_10[col]
+
+        except Exception:
+            # If model prediction on X_tensor fails, skip intervals
+            pass
+    except Exception:
+        # Unable to prepare sequences; skip CI computation
+        pass
+
     save_dataframe_to_gcs(
         df=combined_df_to_save,
         bucket_name=bucket_name,
